@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {console} from "forge-std/console.sol";
 
 import {MLDSA65} from "../src/MLDSA65.sol";
+import {MLDSA65KeyFactory, MLDSA65Keys} from "../src/MLDSA65KeyFactory.sol";
 
 /// Calls the library from a fresh external frame. Gas figures are taken across this
 /// call so the quadratic memory-expansion cost starts from zero, as it would in a
@@ -30,18 +31,120 @@ contract MLDSA65Harness {
         return MLDSA65.verifyInternal(pk, mPrime, sig);
     }
 
-    function verifyWithExpandedA(
-        bytes calldata pk,
-        bytes calldata aHat,
-        bytes calldata ctx,
-        bytes calldata m,
-        bytes calldata sig
-    ) external view returns (bool) {
-        return MLDSA65.verifyWithExpandedA(pk, aHat, ctx, m, sig);
+    function precompute(bytes calldata pk) external pure returns (bytes memory) {
+        return MLDSA65.precompute(pk);
     }
 
-    function expandA(bytes32 rho) external pure returns (bytes memory) {
-        return MLDSA65.expandA(rho);
+    function verifyPrecomputedWithContext(bytes calldata blob, bytes calldata ctx, bytes calldata m, bytes calldata sig)
+        external
+        view
+        returns (bool)
+    {
+        return MLDSA65.verifyPrecomputedWithContext(blob, ctx, m, sig);
+    }
+
+    function verifyPrecomputed(bytes calldata blob, bytes calldata m, bytes calldata sig)
+        external
+        view
+        returns (bool)
+    {
+        return MLDSA65.verifyPrecomputed(blob, m, sig);
+    }
+
+    function verifyPrecomputedInternal(bytes calldata blob, bytes calldata mPrime, bytes calldata sig)
+        external
+        view
+        returns (bool)
+    {
+        return MLDSA65.verifyPrecomputedInternal(blob, mPrime, sig);
+    }
+
+    /// The consumer pattern: a wallet holds (factory, pkHash) and verifies in its own
+    /// context through the library.
+    function verifyByHash(address factory, bytes32 pkHash, bytes calldata m, bytes calldata sig)
+        external
+        view
+        returns (bool)
+    {
+        return MLDSA65Keys.verify(factory, pkHash, m, sig);
+    }
+
+    /// Gas of the load alone and of the verification after it, in one frame.
+    function verifyByHashSplit(address factory, bytes32 pkHash, bytes calldata m, bytes calldata sig)
+        external
+        view
+        returns (uint256 loadGas, uint256 verifyGas, bool ok)
+    {
+        uint256 t = gasleft();
+        bytes memory blob = MLDSA65Keys.load(factory, pkHash);
+        loadGas = t - gasleft();
+        t = gasleft();
+        ok = MLDSA65.verifyPrecomputed(blob, m, sig);
+        verifyGas = t - gasleft();
+    }
+
+    /// verifyPrecomputed re-run phase by phase (same order as `_verifyCore`'s blob
+    /// path): [0] decode h + z, [1] 5×NTT(z), [2] μ, [3] SampleInBall + NTT(c),
+    /// [4] Â∘ẑ from the blob, [5] 6×(−ĉ·t̂ from the blob), [6] 6×NTT⁻¹,
+    /// [7] UseHint + w1Encode, [8] c̃′, [9] total.
+    function phasesPrecomputed(bytes memory blob, bytes memory mPrime, bytes memory sig)
+        external
+        view
+        returns (uint256[10] memory g, bool ok)
+    {
+        uint256 t0 = gasleft();
+        uint256 t = t0;
+        (, uint256[6] memory hints) = MLDSA65.hintBitUnpack(sig);
+        uint256 zHat = MLDSA65._allocWords(5 * 256 + 8);
+        MLDSA65.decodeZ(sig, zHat);
+        uint256 zp = MLDSA65._ptr(MLDSA65._zetas());
+        (g[0], t) = (t - gasleft(), gasleft());
+        for (uint256 j; j < 5; ++j) {
+            MLDSA65.ntt(zHat + j * 0x2000, zp);
+        }
+        (g[1], t) = (t - gasleft(), gasleft());
+        uint256 ks = MLDSA65.newKeccakWorkspace();
+        bytes memory w1Buf = new bytes(64 + 6 * 128);
+        bytes32 tr0;
+        bytes32 tr1;
+        assembly ("memory-safe") {
+            tr0 := mload(add(blob, 0x20))
+            tr1 := mload(add(blob, 0x40))
+        }
+        bytes memory trM = abi.encodePacked(tr0, tr1, mPrime);
+        (bytes32 mu0, bytes32 mu1) = MLDSA65.shake256To64(ks, MLDSA65._ptr(trM), trM.length);
+        assembly ("memory-safe") {
+            mstore(add(w1Buf, 0x20), mu0)
+            mstore(add(w1Buf, 0x40), mu1)
+        }
+        (g[2], t) = (t - gasleft(), gasleft());
+        uint256 cHat = MLDSA65._allocWords(256);
+        MLDSA65.sampleInBall(ks, MLDSA65._ptr(sig), cHat);
+        MLDSA65.ntt(cHat, zp);
+        (g[3], t) = (t - gasleft(), gasleft());
+        uint256 acc = MLDSA65._allocStrided(6);
+        MLDSA65.mulPackedA(MLDSA65._ptr(blob) + 64, zHat, acc);
+        (g[4], t) = (t - gasleft(), gasleft());
+        for (uint256 i; i < 6; ++i) {
+            MLDSA65._subProductPacked(acc + i * 0x2100, cHat, MLDSA65._ptr(blob) + 23104 + i * 768);
+        }
+        (g[5], t) = (t - gasleft(), gasleft());
+        for (uint256 i; i < 6; ++i) {
+            MLDSA65.invNtt(acc + i * 0x2100, zp);
+        }
+        (g[6], t) = (t - gasleft(), gasleft());
+        for (uint256 i; i < 6; ++i) {
+            MLDSA65.useHintPack(acc + i * 0x2100, hints[i], MLDSA65._ptr(w1Buf) + 64 + i * 128);
+        }
+        (g[7], t) = (t - gasleft(), gasleft());
+        (bytes32 c0,) = MLDSA65.shake256To64(ks, MLDSA65._ptr(w1Buf), w1Buf.length);
+        (g[8], t) = (t - gasleft(), gasleft());
+        g[9] = t0 - gasleft();
+        bytes32 sig0;
+        assembly ("memory-safe") {
+            sig0 := mload(add(sig, 0x20))
+        }
+        ok = c0 == sig0;
     }
 
     /// Algorithm 8 re-run phase by phase with gasleft() checkpoints (same building
@@ -139,8 +242,33 @@ contract MLDSA65VerifyOnly {
     }
 }
 
+/// Minimal consumer of the registered-key path only, for its inlined code size.
+contract MLDSA65StoredOnly {
+    address internal immutable FACTORY;
+
+    constructor(address factory) {
+        FACTORY = factory;
+    }
+
+    function verify(bytes32 pkHash, bytes calldata m, bytes calldata sig) external view returns (bool) {
+        return MLDSA65Keys.verify(FACTORY, pkHash, m, sig);
+    }
+}
+
+/// Deploys the factory's fixed data init code with the factory's own salts — from a
+/// different address, so the CREATE2 address cannot coincide.
+contract SquatterCreate2 {
+    function squat(bytes32 salt) external returns (address a) {
+        bytes memory init = MLDSA65Keys.DATA_INITCODE;
+        assembly ("memory-safe") {
+            a := create2(0, add(init, 0x20), mload(init), salt)
+        }
+    }
+}
+
 contract MLDSA65Test is Test {
     MLDSA65Harness internal h;
+    MLDSA65KeyFactory internal factory;
     string internal diff;
     string internal acvp;
 
@@ -152,6 +280,7 @@ contract MLDSA65Test is Test {
 
     function setUp() public {
         h = new MLDSA65Harness();
+        factory = new MLDSA65KeyFactory();
         diff = vm.readFile("test/mldsa/differential.json");
         acvp = vm.readFile("test/mldsa/acvp.json");
         pks = vm.parseJsonBytesArray(diff, ".pk");
@@ -202,7 +331,7 @@ contract MLDSA65Test is Test {
             assertEq(abi.encodePacked(a, b), mus[v], "mu");
 
             // ExpandA check: Â[0][0] is the first 768 bytes of the packed Â.
-            assertEq(_slice(h.expandA(bytes32(_slice(pks[v], 0, 32))), 0, 768), a00s[v], "A_hat[0][0]");
+            assertEq(_slice(h.precompute(pks[v]), 64, 768), a00s[v], "A_hat[0][0]");
         }
     }
 
@@ -214,6 +343,14 @@ contract MLDSA65Test is Test {
                 ? h.verify(pks[v], msgs[v], sigs[v])
                 : h.verifyWithContext(pks[v], ctxs[v], msgs[v], sigs[v]);
             assertTrue(ok, string.concat("differential vector ", vm.toString(v)));
+            bytes memory blob = h.precompute(pks[v]);
+            assertTrue(
+                ctxs[v].length == 0
+                    ? h.verifyPrecomputed(blob, msgs[v], sigs[v])
+                    : h.verifyPrecomputedWithContext(blob, ctxs[v], msgs[v], sigs[v]),
+                string.concat("precomputed, vector ", vm.toString(v))
+            );
+            assertFalse(h.verifyPrecomputedWithContext(blob, hex"01", msgs[v], sigs[v]));
             // The context is bound: the same signature under another context fails.
             assertFalse(h.verifyWithContext(pks[v], hex"01", msgs[v], sigs[v]));
         }
@@ -243,10 +380,16 @@ contract MLDSA65Test is Test {
         bool[] memory expected = vm.parseJsonBoolArray(acvp, string.concat(g, ".passed"));
         string[] memory reason = vm.parseJsonStringArray(acvp, string.concat(g, ".reason"));
         for (uint256 n; n < ids.length; ++n) {
+            bytes memory blob = h.precompute(pk[n]);
             bool got = external_
                 ? h.verifyWithContext(pk[n], ctx[n], m[n], sig[n])
                 : h.verifyInternal(pk[n], m[n], sig[n]);
-            assertEq(got, expected[n], string.concat("tcId ", vm.toString(ids[n]), ": ", reason[n]));
+            bool gotPre = external_
+                ? h.verifyPrecomputedWithContext(blob, ctx[n], m[n], sig[n])
+                : h.verifyPrecomputedInternal(blob, m[n], sig[n]);
+            string memory what = string.concat("tcId ", vm.toString(ids[n]), ": ", reason[n]);
+            assertEq(got, expected[n], what);
+            assertEq(gotPre, got, string.concat("precomputed != reference, ", what));
             if (expected[n]) ++pass;
             else ++fail;
         }
@@ -370,27 +513,128 @@ contract MLDSA65Test is Test {
         assertFalse(h.verify(pk, m, s));
     }
 
-    // ── Precomputed Â (verifyWithExpandedA) ──────────────────────────────────
+    // ── Precomputation (verifyPrecomputed, MLDSA65KeyFactory) ────────────────
 
-    function test_expandedA_allVerify() public view {
+    /// precompute(pk) byte-for-byte against dilithium-py's tr, Â and NTT(t1·2^d).
+    function test_precompute_matchesReference() public view {
+        assertEq(h.precompute(pks[1]), vm.parseJsonBytes(diff, ".blob1"));
+        assertEq(h.precompute(_trim(pks[1], 1)).length, 0, "bad pk -> empty");
+    }
+
+    function test_precomputed_rejects() public view {
+        (bytes memory pk, bytes memory m, bytes memory sig) = (pks[1], msgs[1], sigs[1]);
+        bytes memory blob = h.precompute(pk);
+        assertTrue(h.verifyPrecomputed(blob, m, sig));
+        assertFalse(h.verifyPrecomputed(_trim(blob, 1), m, sig), "short blob");
+        assertFalse(h.verifyPrecomputed("", m, sig), "empty blob");
+        assertFalse(h.verifyPrecomputed(_flip(blob, 8 * 3), m, sig), "tampered tr");
+        assertFalse(h.verifyPrecomputed(_flip(blob, 8 * 1000), m, sig), "tampered A_hat");
+        assertFalse(h.verifyPrecomputed(_flip(blob, 8 * 25000), m, sig), "tampered t_hat");
+        assertFalse(h.verifyPrecomputed(blob, _flip(m, 0), sig), "message");
+        assertFalse(h.verifyPrecomputed(blob, m, _flip(sig, 0)), "c~");
+        assertFalse(h.verifyPrecomputed(blob, m, _trim(sig, 1)), "short sig");
+        // The precomputation of another key (seed 2; pks[0..1] share seed 1).
+        assertFalse(h.verifyPrecomputed(h.precompute(pks[2]), m, sig), "foreign key blob");
+    }
+
+    function test_factory_contentsMatchPrecompute() public {
+        bytes32 pkHash = keccak256(pks[1]);
+        (address a, address t) = factory.addressesOf(pkHash);
+        assertEq(a, factory.registerA(pks[1]));
+        assertEq(t, factory.registerT(pks[1]));
+        bytes memory blob = h.precompute(pks[1]);
+        // Byte for byte: 0x00 ‖ Â and 0x00 ‖ tr ‖ t̂.
+        assertEq(a.code, abi.encodePacked(bytes1(0), _slice(blob, 64, 23040)));
+        assertEq(t.code, abi.encodePacked(bytes1(0), _slice(blob, 0, 64), _slice(blob, 23104, 4608)));
+        assertEq(factory.load(pkHash), blob);
+        assertEq(factory.load(pkHash), vm.parseJsonBytes(diff, ".blob1"), "vs dilithium-py");
+        assertTrue(factory.isRegistered(pkHash));
+        assertTrue(factory.verify(pkHash, msgs[1], sigs[1]));
+        assertTrue(h.verifyByHash(address(factory), pkHash, msgs[1], sigs[1]));
+        assertFalse(factory.verify(pkHash, _flip(msgs[1], 0), sigs[1]));
+        // Library-side derivation agrees with the factory's.
+        (address a2, address t2) = MLDSA65Keys.addressesOf(address(factory), pkHash);
+        assertEq(a2, a);
+        assertEq(t2, t);
+    }
+
+    /// Every differential vector through register + verify(pkHash), with contexts.
+    function test_factory_allVectors() public {
         for (uint256 v; v < pks.length; ++v) {
-            bytes memory aHat = h.expandA(bytes32(_slice(pks[v], 0, 32)));
-            assertEq(aHat.length, MLDSA65.A_HAT_BYTES);
-            assertTrue(h.verifyWithExpandedA(pks[v], aHat, ctxs[v], msgs[v], sigs[v]), vm.toString(v));
+            factory.registerA(pks[v]);
+            factory.registerT(pks[v]);
+            bytes32 pkHash = keccak256(pks[v]);
+            assertTrue(factory.verifyWithContext(pkHash, ctxs[v], msgs[v], sigs[v]), vm.toString(v));
+            assertFalse(factory.verifyWithContext(pkHash, hex"01", msgs[v], sigs[v]));
         }
     }
 
-    function test_expandedA_rejects() public view {
-        (bytes memory pk, bytes memory m, bytes memory sig) = (pks[1], msgs[1], sigs[1]);
-        bytes memory aHat = h.expandA(bytes32(_slice(pk, 0, 32)));
-        assertFalse(h.verifyWithExpandedA(pk, _trim(aHat, 1), "", m, sig), "short aHat");
-        assertFalse(h.verifyWithExpandedA(pk, "", "", m, sig), "empty aHat");
-        assertFalse(h.verifyWithExpandedA(pk, _flip(aHat, 8 * 1000), "", m, sig), "tampered aHat");
-        assertFalse(h.verifyWithExpandedA(pk, aHat, "", _flip(m, 0), sig), "message");
-        assertFalse(h.verifyWithExpandedA(pk, aHat, "", m, _flip(sig, 0)), "c~");
-        // Â of another key: fails even though it is a well-formed Â.
-        bytes memory other = h.expandA(bytes32(_slice(pks[2], 0, 32))); // key seed 2 (pks[0..1] share seed 1)
-        assertFalse(h.verifyWithExpandedA(pk, other, "", m, sig), "foreign aHat");
+    function test_factory_unregisteredAndForeign() public {
+        bytes32 h1 = keccak256(pks[1]);
+        // Nothing registered: false, no revert.
+        assertFalse(factory.isRegistered(h1));
+        assertEq(factory.load(h1).length, 0);
+        assertFalse(factory.verify(h1, msgs[1], sigs[1]), "unregistered");
+        // Half registered: still false.
+        factory.registerA(pks[1]);
+        assertFalse(factory.verify(h1, msgs[1], sigs[1]), "only A registered");
+        factory.registerT(pks[1]);
+        assertTrue(factory.verify(h1, msgs[1], sigs[1]));
+        // pkHash of key X with key Y's valid signature (seed 2 vs seed 1).
+        factory.registerA(pks[2]);
+        factory.registerT(pks[2]);
+        assertTrue(factory.verify(keccak256(pks[2]), msgs[2], sigs[2]));
+        assertFalse(factory.verify(keccak256(pks[2]), msgs[1], sigs[1]), "key X hash, key Y signature");
+        assertFalse(factory.verify(h1, msgs[2], sigs[2]), "key Y hash, key X signature");
+        // Malformed key: registration reverts (setup call), verification never does.
+        vm.expectRevert(MLDSA65KeyFactory.InvalidPublicKey.selector);
+        factory.registerA(_trim(pks[1], 1));
+        vm.expectRevert(MLDSA65KeyFactory.InvalidPublicKey.selector);
+        factory.registerT(abi.encodePacked(pks[1], bytes1(0)));
+    }
+
+    function test_factory_idempotent() public {
+        uint256 first = gasleft();
+        address a = factory.registerA(pks[1]);
+        address t = factory.registerT(pks[1]);
+        first -= gasleft();
+        bytes memory before = factory.load(keccak256(pks[1]));
+        uint256 g = gasleft();
+        assertEq(factory.registerA(pks[1]), a);
+        assertEq(factory.registerT(pks[1]), t);
+        g -= gasleft();
+        // (absolute numbers here include this test contract's large-memory overhead)
+        assertLt(g * 20, first, "re-register is a lookup, not a recompute");
+        assertEq(factory.load(keccak256(pks[1])), before);
+    }
+
+    /// Only the factory can occupy the derived addresses: the same init code and
+    /// salts from any other deployer land elsewhere, and the factory hands its staged
+    /// code to nobody but the contract it is creating.
+    function test_factory_addressesOnlyFromFactory() public {
+        bytes32 pkHash = keccak256(pks[1]);
+        (address a, address t) = factory.addressesOf(pkHash);
+        SquatterCreate2 squatter = new SquatterCreate2();
+        // The squatter's child asks the squatter (no fallback) for code -> create fails
+        // or, at best, lands at the squatter's own CREATE2 address — never at a / t.
+        address sa = squatter.squat(MLDSA65Keys.saltA(pkHash));
+        address st = squatter.squat(MLDSA65Keys.saltT(pkHash));
+        assertTrue(sa != a && st != t);
+        (address oa, address ot) = MLDSA65Keys.addressesOf(address(squatter), pkHash);
+        assertTrue(oa != a && ot != t);
+        // A second factory derives different addresses for the same key.
+        MLDSA65KeyFactory f2 = new MLDSA65KeyFactory();
+        (address a2, address t2) = f2.addressesOf(pkHash);
+        assertTrue(a2 != a && t2 != t);
+        // Nothing is at a / t until this factory registers the key.
+        assertEq(a.code.length, 0);
+        assertEq(t.code.length, 0);
+        // The factory's fallback refuses outside callers (no staged code leaks).
+        (bool ok,) = address(factory).call("");
+        assertFalse(ok);
+        factory.registerA(pks[1]);
+        (ok,) = address(factory).call("");
+        assertFalse(ok, "fallback after registration");
     }
 
     // ── Gas ──────────────────────────────────────────────────────────────────
@@ -407,22 +651,73 @@ contract MLDSA65Test is Test {
         }
         console.log("max verify gas over differential vectors:", maxGas);
 
-        // With a caller-supplied Â (calldata here; from an SSTORE2 blob add
-        // EXTCODECOPY of 23040 bytes, ~2.6k cold access + ~2.2k copy + memory).
+    }
+
+    function test_gas_precomputed() public {
+        uint256 g = gasleft();
+        bytes memory blob = h.precompute(pks[1]);
+        console.log("precompute (one-off, in memory) gas:", g - gasleft());
         uint256 maxPre;
         for (uint256 v; v < pks.length; ++v) {
-            bytes memory aHat = h.expandA(bytes32(_slice(pks[v], 0, 32)));
-            uint256 g = gasleft();
-            bool ok = h.verifyWithExpandedA(pks[v], aHat, ctxs[v], msgs[v], sigs[v]);
+            bytes memory b = h.precompute(pks[v]);
+            g = gasleft();
+            bool ok = h.verifyPrecomputedWithContext(b, ctxs[v], msgs[v], sigs[v]);
             g -= gasleft();
             assertTrue(ok);
-            console.log("verifyWithExpandedA gas (vector, msg bytes, gas):", v, msgs[v].length, g);
+            console.log("verifyPrecomputed gas, blob as calldata (vector, msg bytes, gas):", v, msgs[v].length, g);
             if (g > maxPre) maxPre = g;
         }
-        console.log("max verifyWithExpandedA gas:", maxPre);
-        uint256 ge = gasleft();
-        h.expandA(bytes32(_slice(pks[0], 0, 32)));
-        console.log("expandA (one-time, per key) gas:", ge - gasleft());
+        console.log("max verifyPrecomputed gas:", maxPre);
+
+        // Registration: two separate transactions, each its own external call.
+        g = gasleft();
+        factory.registerA(pks[1]);
+        console.log("registerA gas (ExpandA + 23,041-byte deploy):", g - gasleft());
+        g = gasleft();
+        factory.registerT(pks[1]);
+        console.log("registerT gas (tr + 6 NTT + 4,673-byte deploy):", g - gasleft());
+        factory.registerA(pks[3]);
+        factory.registerT(pks[3]);
+
+        // Verification by pkHash, all accounts cold as in a fresh transaction.
+        bytes32 h1 = keccak256(pks[1]);
+        bytes32 h3 = keccak256(pks[3]);
+        _coolKey(h1);
+        (uint256 lg, uint256 vg, bool ok1) = h.verifyByHashSplit(address(factory), h1, msgs[1], sigs[1]);
+        assertTrue(ok1);
+        console.log("by pkHash, 32-byte msg: load gas (cold)", lg);
+        console.log("by pkHash, 32-byte msg: verifyPrecomputed gas after load", vg);
+        _coolKey(h1);
+        g = gasleft();
+        assertTrue(h.verifyByHash(address(factory), h1, msgs[1], sigs[1]));
+        console.log("consumer verify(factory, pkHash), 32-byte msg, gas:", g - gasleft());
+        _coolKey(h1);
+        g = gasleft();
+        assertTrue(factory.verify(h1, msgs[1], sigs[1]));
+        console.log("factory.verify(pkHash), 32-byte msg, gas:", g - gasleft());
+        _coolKey(h3);
+        g = gasleft();
+        assertTrue(h.verifyByHash(address(factory), h3, msgs[3], sigs[3]));
+        console.log("consumer verify(factory, pkHash), 3000-byte msg, gas:", g - gasleft());
+
+        bytes memory mPrime = abi.encodePacked(bytes1(0), bytes1(0), msgs[1]);
+        (uint256[10] memory ph, bool okp) = h.phasesPrecomputed(blob, mPrime, sigs[1]);
+        assertTrue(okp);
+        string[10] memory names = [
+            "pre: decode h + z",
+            "pre: 5x NTT(z)",
+            "pre: mu = H(tr||M',64)",
+            "pre: SampleInBall + NTT(c)",
+            "pre: A_hat*z from blob",
+            "pre: 6x c*t_hat from blob",
+            "pre: 6x inverse NTT",
+            "pre: UseHint + w1Encode",
+            "pre: c~' = H(mu||w1,48)",
+            "pre: TOTAL (phase harness)"
+        ];
+        for (uint256 n; n < 10; ++n) {
+            console.log(names[n], ph[n]);
+        }
     }
 
     function test_gas_phases() public view {
@@ -454,6 +749,13 @@ contract MLDSA65Test is Test {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    function _coolKey(bytes32 pkHash) internal {
+        (address a, address t) = factory.addressesOf(pkHash);
+        vm.cool(a);
+        vm.cool(t);
+        vm.cool(address(factory));
+    }
 
     /// keccak256 built from the library's permutation (rate 136, pad 0x01 … 0x80).
     function _keccakViaLib(bytes memory data) internal pure returns (bytes32 out) {

@@ -8,8 +8,8 @@ pragma solidity ^0.8.24;
 ///         Every malformed input — wrong lengths, an over-long context, a hint
 ///         encoding Algorithm 21 rejects, ||z||∞ ≥ γ1 − β — yields `false`; the
 ///         library never reverts on attacker-controlled bytes.
-///         `expandA` + `verifyWithExpandedA` split off the per-key work (deriving Â
-///         from ρ, ~40% of verification gas) for callers that can store Â per key.
+///         `precompute` + `verifyPrecomputed` split off the per-key work (tr, Â and
+///         NTT(t1·2^d)); `MLDSA65KeyFactory` stores it in data contracts.
 /// @dev    Parameter set ML-DSA-65: q = 8380417, d = 13, τ = 49, λ = 192 (c̃ is 48
 ///         bytes), γ1 = 2^19, γ2 = (q − 1)/32, (k, ℓ) = (6, 5), η = 4, β = τ·η = 196,
 ///         ω = 55. pk = ρ ‖ t1 (32 + 6·320 = 1952 bytes); σ = c̃ ‖ z ‖ h
@@ -74,14 +74,23 @@ library MLDSA65 {
     ///      writes a whole group of 8 candidates before checking for 256.
     uint256 internal constant ACC_STRIDE = 0x2100;
 
-    /// @dev Â packed for `verifyWithExpandedA`: k·ℓ·256 coefficients, 3 bytes each,
-    ///      big-endian, order [i][j][n]. 23040 bytes — fits one SSTORE2-style code
-    ///      blob (EIP-170: 24576).
-    uint256 internal constant A_HAT_BYTES = 23040;
+    /// @dev Per-key precomputation (`precompute`), all coefficients 3 bytes big-endian:
+    ///        [0, 64)          tr = H(pk, 64)
+    ///        [64, 23104)      Â = ExpandA(ρ): k·ℓ = 30 polynomials, order [i][j][n]
+    ///        [23104, 27712)   t̂ = NTT(t1·2^d) mod q: k = 6 polynomials, order [i][n]
+    ///      27712 bytes exceed EIP-170 (24576), so `MLDSA65KeyFactory` stores Â and tr ‖ t̂
+    ///      in two data contracts.
+    uint256 internal constant TR_BYTES = 64;
+    uint256 internal constant A_HAT_BYTES = 23040; //   30·256·3
+    uint256 internal constant T_HAT_BYTES = 4608; //    6·256·3
+    uint256 internal constant BLOB_BYTES = 27712; //    64 + 23040 + 4608
+    uint256 private constant A_HAT_OFFSET = 64;
+    uint256 private constant T_HAT_OFFSET = 23104;
 
     // ── Public API ───────────────────────────────────────────────────────────
 
-    /// @notice ML-DSA.Verify (Algorithm 3) with the empty context string.
+    /// @notice ML-DSA.Verify (Algorithm 3) with the empty context string. The
+    ///         reference path: everything is derived from the public key.
     function verify(bytes memory publicKey, bytes memory message, bytes memory signature)
         internal
         view
@@ -99,7 +108,7 @@ library MLDSA65 {
         bytes memory signature
     ) internal view returns (bool) {
         if (ctx.length > 255) return false;
-        return verifyInternal(publicKey, abi.encodePacked(bytes1(0x00), uint8(ctx.length), ctx, message), signature);
+        return verifyInternal(publicKey, _formatMessage(ctx, message), signature);
     }
 
     /// @notice ML-DSA.Verify_internal (Algorithm 8) over an already-formatted M′.
@@ -110,64 +119,133 @@ library MLDSA65 {
         view
         returns (bool)
     {
+        if (publicKey.length != PK_BYTES) return false;
         return _verifyCore(publicKey, "", mPrime, signature);
     }
 
-    /// @notice `verifyWithContext` with Â supplied by the caller instead of being
-    ///         re-derived from ρ by 30 SHAKE128 streams (the dominant cost).
-    /// @dev    TRUST: `aHat` MUST be `expandA(ρ)` for THIS public key's ρ, computed
-    ///         once and stored bound to the key (e.g. an SSTORE2 code blob whose
-    ///         address is registered together with the pk). An attacker-chosen Â
-    ///         makes forgery trivial — this function does not (and cannot cheaply)
-    ///         check it. Returns false if `aHat` is not exactly A_HAT_BYTES long.
-    function verifyWithExpandedA(
-        bytes memory publicKey,
-        bytes memory aHat,
-        bytes memory ctx,
-        bytes memory message,
-        bytes memory signature
-    ) internal view returns (bool) {
-        if (ctx.length > 255 || aHat.length != A_HAT_BYTES) return false;
-        return _verifyCore(
-            publicKey, aHat, abi.encodePacked(bytes1(0x00), uint8(ctx.length), ctx, message), signature
-        );
+    /// @notice Everything in Algorithm 8 that depends only on the public key, done
+    ///         once: tr = H(pk, 64), Â = ExpandA(ρ), t̂ = NTT(t1·2^d). Layout at
+    ///         BLOB_BYTES. Returns empty bytes for a wrongly-sized key.
+    /// @dev    Deterministic in pk alone, so the blob can be re-derived and compared
+    ///         by anyone; `MLDSA65KeyFactory` runs it on-chain from the key itself.
+    function precompute(bytes memory publicKey) internal pure returns (bytes memory blob) {
+        if (publicKey.length != PK_BYTES) return blob;
+        blob = new bytes(BLOB_BYTES);
+        uint256 out = _ptr(blob);
+        uint256 ks = newKeccakWorkspace();
+        _writeTr(ks, publicKey, out);
+        _writeAHat(ks, publicKey, out + A_HAT_OFFSET);
+        _writeTHat(publicKey, out + T_HAT_OFFSET);
     }
 
-    /// @notice ExpandA (Algorithm 32): Â ∈ T_q^{k×ℓ} from ρ, packed as described at
-    ///         A_HAT_BYTES. Meant to be run once per key (off-chain or in a setup
-    ///         transaction) and stored; see `verifyWithExpandedA`.
-    function expandA(bytes32 rho) internal pure returns (bytes memory aHat) {
-        uint256 ks = newKeccakWorkspace();
+    /// @notice The Â part of `precompute` alone (A_HAT_BYTES; depends on ρ only).
+    ///         Empty for a wrongly-sized key.
+    function precomputeA(bytes memory publicKey) internal pure returns (bytes memory aHat) {
+        if (publicKey.length != PK_BYTES) return aHat;
+        aHat = new bytes(A_HAT_BYTES);
+        _writeAHat(newKeccakWorkspace(), publicKey, _ptr(aHat));
+    }
+
+    /// @notice The tr ‖ t̂ parts of `precompute` (TR_BYTES + T_HAT_BYTES). Empty for
+    ///         a wrongly-sized key.
+    function precomputeT(bytes memory publicKey) internal pure returns (bytes memory trTHat) {
+        if (publicKey.length != PK_BYTES) return trTHat;
+        trTHat = new bytes(TR_BYTES + T_HAT_BYTES);
+        _writeTr(newKeccakWorkspace(), publicKey, _ptr(trTHat));
+        _writeTHat(publicKey, _ptr(trTHat) + TR_BYTES);
+    }
+
+    /// @dev tr = H(pk, 64) → 64 bytes at `out`.
+    function _writeTr(uint256 ks, bytes memory publicKey, uint256 out) private pure {
+        (bytes32 tr0, bytes32 tr1) = shake256To64(ks, _ptr(publicKey), PK_BYTES);
+        assembly ("memory-safe") {
+            mstore(out, tr0)
+            mstore(add(out, 0x20), tr1)
+        }
+    }
+
+    /// @dev Â = ExpandA(ρ), packed → A_HAT_BYTES at `out`.
+    function _writeAHat(uint256 ks, bytes memory publicKey, uint256 out) private pure {
+        bytes32 rho;
+        assembly ("memory-safe") {
+            rho := mload(add(publicKey, 0x20))
+        }
         uint256 polys = _allocStrided(K * L);
         uint256 ones = _allocStrided(1); // sample against z ≡ 1: acc = Â[i][j] itself
         assembly ("memory-safe") {
             for { let p := ones } lt(p, add(ones, ACC_STRIDE)) { p := add(p, 0x20) } { mstore(p, 1) }
         }
         sampleMatrix(ks, rho, ones, 0, polys, false);
-        aHat = new bytes(A_HAT_BYTES);
-        assembly ("memory-safe") {
-            let out := add(aHat, 0x20)
-            for { let m := 0 } lt(m, 30) { m := add(m, 1) } {
-                let src := add(polys, mul(m, ACC_STRIDE))
-                for { let n := 0 } lt(n, 256) { n := add(n, 1) } {
-                    let v := mload(add(src, shl(5, n)))
-                    mstore8(out, shr(16, v))
-                    mstore8(add(out, 1), shr(8, v))
-                    mstore8(add(out, 2), v)
-                    out := add(out, 3)
-                }
-            }
+        for (uint256 m; m < K * L; ++m) {
+            _pack3(polys + m * ACC_STRIDE, out + m * 768);
         }
     }
 
-    /// @dev Algorithm 8. `aHat` empty → Â is streamed from ρ (fused with Â∘ẑ);
-    ///      otherwise it is the caller-trusted packed Â (length already checked).
-    function _verifyCore(bytes memory publicKey, bytes memory aHat, bytes memory mPrime, bytes memory signature)
+    /// @dev t̂ = NTT(t1·2^d) mod q, packed → T_HAT_BYTES at `out`.
+    function _writeTHat(bytes memory publicKey, uint256 out) private pure {
+        uint256 zp = _ptr(_zetas());
+        uint256 t = _allocWords(256);
+        for (uint256 i; i < K; ++i) {
+            decodeT1(publicKey, i, t);
+            ntt(t, zp);
+            _scale(t, 1 << D); // also reduces into [0, q)
+            _pack3(t, out + i * 768);
+        }
+    }
+
+    /// @notice `verify` against a `precompute` blob instead of the public key.
+    /// @dev    TRUST: the blob is taken as `precompute(pk)` of the key the caller
+    ///         means. Verification checks the signature against tr, Â and t̂ ONLY —
+    ///         the key itself is not available here, so nothing ties the blob back to
+    ///         it. A blob built from Â/t̂ chosen by an attacker makes forgery easy;
+    ///         the blob must come from `precompute` over the registered key (see
+    ///         `MLDSA65KeyFactory`, which computes it on-chain from the key and keys
+    ///         both data contracts by keccak256(pk)). A blob of another (honest) key simply fails
+    ///         to verify. Returns false for a blob that is not BLOB_BYTES long.
+    function verifyPrecomputed(bytes memory blob, bytes memory message, bytes memory signature)
+        internal
+        view
+        returns (bool)
+    {
+        return verifyPrecomputedWithContext(blob, "", message, signature);
+    }
+
+    /// @notice `verifyPrecomputed` with a context string (Algorithm 3's M′).
+    function verifyPrecomputedWithContext(
+        bytes memory blob,
+        bytes memory ctx,
+        bytes memory message,
+        bytes memory signature
+    ) internal view returns (bool) {
+        if (ctx.length > 255) return false;
+        return verifyPrecomputedInternal(blob, _formatMessage(ctx, message), signature);
+    }
+
+    /// @notice Algorithm 8 over a formatted M′, against a `precompute` blob.
+    function verifyPrecomputedInternal(bytes memory blob, bytes memory mPrime, bytes memory signature)
+        internal
+        view
+        returns (bool)
+    {
+        if (blob.length != BLOB_BYTES) return false;
+        return _verifyCore("", blob, mPrime, signature);
+    }
+
+    /// @dev M′ = 0x00 ‖ |ctx| ‖ ctx ‖ M (caller checked |ctx| ≤ 255).
+    function _formatMessage(bytes memory ctx, bytes memory message) private pure returns (bytes memory) {
+        return abi.encodePacked(bytes1(0x00), uint8(ctx.length), ctx, message);
+    }
+
+    /// @dev Algorithm 8. Exactly one of `publicKey` / `blob` is non-empty (length
+    ///      already checked): with the key, tr is hashed, Â is streamed from ρ (fused
+    ///      with Â∘ẑ) and t̂ is transformed here; with the blob, all three are read.
+    function _verifyCore(bytes memory publicKey, bytes memory blob, bytes memory mPrime, bytes memory signature)
         private
         pure
         returns (bool)
     {
-        if (publicKey.length != PK_BYTES || signature.length != SIG_BYTES) return false;
+        if (signature.length != SIG_BYTES) return false;
+        bool pre = blob.length != 0;
 
         // Algorithm 21 (HintBitUnpack): cheap, and a malformed h is a rejection.
         (bool hintOk, uint256[K] memory hints) = hintBitUnpack(signature);
@@ -186,10 +264,19 @@ library MLDSA65 {
 
         uint256 ks = newKeccakWorkspace();
 
-        // tr ← H(pk, 64);  μ ← H(BytesToBits(tr) ‖ M′, 64)
+        // tr ← H(pk, 64) (or from the blob);  μ ← H(BytesToBits(tr) ‖ M′, 64)
         bytes memory w1Buf = new bytes(64 + K * W1_POLY_BYTES); // μ ‖ w1Encode(w1′)
         {
-            (bytes32 tr0, bytes32 tr1) = shake256To64(ks, _ptr(publicKey), PK_BYTES);
+            bytes32 tr0;
+            bytes32 tr1;
+            if (pre) {
+                assembly ("memory-safe") {
+                    tr0 := mload(add(blob, 0x20))
+                    tr1 := mload(add(blob, 0x40))
+                }
+            } else {
+                (tr0, tr1) = shake256To64(ks, _ptr(publicKey), PK_BYTES);
+            }
             bytes memory trM = abi.encodePacked(tr0, tr1, mPrime);
             (bytes32 mu0, bytes32 mu1) = shake256To64(ks, _ptr(trM), trM.length);
             assembly ("memory-safe") {
@@ -198,31 +285,36 @@ library MLDSA65 {
             }
         }
 
-        // c ← SampleInBall(c̃);  ĉ′ = NTT(c)·2^d  (folds the t1·2^d scaling into ĉ)
+        // c ← SampleInBall(c̃);  ĉ = NTT(c). On the key path ĉ′ = ĉ·2^d folds the
+        // t1·2^d scaling into ĉ; the blob's t̂ already carries it.
         uint256 cHat = _allocWords(256);
         sampleInBall(ks, _ptr(signature), cHat);
         ntt(cHat, zp);
-        _scale(cHat, 1 << D);
+        if (!pre) _scale(cHat, 1 << D);
 
         // acc_i = Σ_j Â[i][j]∘ẑ_j for all rows (unreduced, < 5·q·10q < 2^56).
         uint256 accs = _allocStrided(K);
-        if (aHat.length == 0) {
+        if (pre) {
+            mulPackedA(_ptr(blob) + A_HAT_OFFSET, zHat, accs);
+        } else {
             bytes32 rho;
             assembly ("memory-safe") {
                 rho := mload(add(publicKey, 0x20))
             }
             sampleMatrix(ks, rho, zHat, 0x2000, accs, true);
-        } else {
-            mulPackedA(aHat, zHat, accs);
         }
 
-        uint256 t1Hat = _allocWords(256);
+        uint256 t1Hat = pre ? 0 : _allocWords(256);
         for (uint256 i; i < K; ++i) {
             uint256 acc = accs + i * ACC_STRIDE;
-            // acc = acc − ĉ′∘NTT(t1_i), reduced into [0, q); then NTT⁻¹.
-            decodeT1(publicKey, i, t1Hat);
-            ntt(t1Hat, zp);
-            _subProduct(acc, cHat, t1Hat);
+            // acc = acc − ĉ∘t̂_i, reduced into [0, q); then NTT⁻¹.
+            if (pre) {
+                _subProductPacked(acc, cHat, _ptr(blob) + T_HAT_OFFSET + i * 768);
+            } else {
+                decodeT1(publicKey, i, t1Hat);
+                ntt(t1Hat, zp);
+                _subProduct(acc, cHat, t1Hat);
+            }
             invNtt(acc, zp);
             // w1′_i = UseHint(h_i, w′_i), packed straight into the hash input.
             useHintPack(acc, hints[i], _ptr(w1Buf) + 64 + i * W1_POLY_BYTES);
@@ -376,7 +468,7 @@ library MLDSA65 {
     ///         coefficient a of Â[i][j] at position n does
     ///             acc[n] += a · z_j[n],  z_j = zBase + j·zStride,
     ///         where acc is row i's accumulator (`perRow`) or stream 5i + j's own
-    ///         polynomial (`!perRow`, used by `expandA` with z ≡ 1, zStride = 0).
+    ///         polynomial (`!perRow`, used by `precompute` with z ≡ 1, zStride = 0).
     ///         Accumulators (stride ACC_STRIDE) must start zeroed.
     /// @dev    A SHAKE128 block is 168 bytes = 56 candidates of 3 bytes, and every 3
     ///         lanes (192 bits) hold exactly 8 of them, so a candidate never
@@ -518,12 +610,11 @@ library MLDSA65 {
         return n;
     }
 
-    /// @notice acc_i[n] = Σ_j Â[i][j][n]·ẑ_j[n] from the packed Â (A_HAT_BYTES
-    ///         layout); accumulators at stride ACC_STRIDE, unreduced like the
-    ///         streamed path.
-    function mulPackedA(bytes memory aHat, uint256 zHat, uint256 accs) internal pure {
+    /// @notice acc_i[n] = Σ_j Â[i][j][n]·ẑ_j[n] from a packed Â at `src` (layout
+    ///         as in BLOB_BYTES); accumulators at stride ACC_STRIDE, unreduced like
+    ///         the streamed path.
+    function mulPackedA(uint256 src, uint256 zHat, uint256 accs) internal pure {
         assembly ("memory-safe") {
-            let src := add(aHat, 0x20)
             for { let i := 0 } lt(i, 6) { i := add(i, 1) } {
                 let acc := add(accs, mul(i, ACC_STRIDE))
                 for { let j := 0 } lt(j, 5) { j := add(j, 1) } {
@@ -628,25 +719,28 @@ library MLDSA65 {
                     mstore(add(j, h), mulmod(add(a1, a3), f, Q))
                 }
             }
-            function zeta(zp_, m) -> z {
-                z := shr(224, mload(add(zp_, shl(2, m))))
-            }
+            let end := add(p, 0x2000)
             for { let l := 0 } lt(l, 8) { l := add(l, 2) } {
-                let bb := shr(l, 128) //   B = 128/len blocks at the first merged layer
+                // B = 128/len blocks at the first merged layer; super-block b′ uses
+                // ζ_{2B−1−2b′}, ζ_{2B−2−2b′} and ζ_{B−1−b′}, walked down by pointer
+                // (zeta table entries are 4 bytes).
+                let z12 := add(zp, shl(2, sub(shl(1, shr(l, 128)), 1)))
+                let z3 := add(zp, shl(2, sub(shr(l, 128), 1)))
                 let h := shl(5, shl(l, 1)) // len in bytes (len = 2^ℓ)
                 let f := 1
                 if eq(l, 6) { f := 8347681 } // 256⁻¹ mod q
-                for { let b := 0 } lt(b, shr(1, bb)) { b := add(b, 1) } {
-                    let s := add(p, mul(b, shl(2, h))) // block of 4·len coefficients
+                for { let s := p } lt(s, end) { s := add(s, shl(2, h)) } {
                     quad(
                         s,
                         add(s, h),
                         h,
-                        zeta(zp, sub(sub(shl(1, bb), 1), shl(1, b))),
-                        zeta(zp, sub(sub(shl(1, bb), 2), shl(1, b))),
-                        mulmod(zeta(zp, sub(sub(bb, 1), b)), f, Q),
+                        shr(224, mload(z12)),
+                        shr(224, mload(sub(z12, 4))),
+                        mulmod(shr(224, mload(z3)), f, Q),
                         f
                     )
+                    z12 := sub(z12, 8)
+                    z3 := sub(z3, 4)
                 }
             }
         }
@@ -661,6 +755,34 @@ library MLDSA65 {
                 acc := add(acc, 0x20)
                 c := add(c, 0x20)
                 t := add(t, 0x20)
+            }
+        }
+    }
+
+    /// @notice acc[n] ← (acc[n] − c[n]·t[n]) mod q with t packed 3 bytes/coefficient at `t`.
+    function _subProductPacked(uint256 acc, uint256 c, uint256 t) internal pure {
+        assembly ("memory-safe") {
+            let end := add(acc, 0x2000)
+            for {} lt(acc, end) {} {
+                mstore(acc, addmod(mload(acc), sub(Q, mulmod(mload(c), shr(232, mload(t)), Q)), Q))
+                acc := add(acc, 0x20)
+                c := add(c, 0x20)
+                t := add(t, 3)
+            }
+        }
+    }
+
+    /// @notice Packs the 256 coefficients at `p` (each < 2^24) as 3-byte big-endian
+    ///         values into the 768 bytes at `out`.
+    function _pack3(uint256 p, uint256 out) internal pure {
+        assembly ("memory-safe") {
+            let end := add(p, 0x2000)
+            for {} lt(p, end) { p := add(p, 0x20) } {
+                let v := mload(p)
+                mstore8(out, shr(16, v))
+                mstore8(add(out, 1), shr(8, v))
+                mstore8(add(out, 2), v)
+                out := add(out, 3)
             }
         }
     }

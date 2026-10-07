@@ -9,7 +9,9 @@ Writes three JSON files next to this script:
                      FIPS 204 implementation), plus per-vector intermediates
                      (tr, mu, w1Encode(w1'), A_hat[0][0]) so a failing
                      Solidity run can be pinned to one phase. Also a few
-                     hand-built malformed signatures (see `malformed`).
+                     hand-built malformed signatures (see `malformed`), and the
+                     expected `MLDSA65.precompute` blob of vector 1 (`blob1`:
+                     tr || A_hat || NTT(t1*2^d) mod q, 3 bytes/coef big-endian).
   acvp.json          The ML-DSA-65 sigVer cases from NIST's ACVP-Server, trimmed
                      to the groups the library exposes:
                        tgId 3  external interface, pure (no pre-hash)  -> verifyWithContext
@@ -78,6 +80,20 @@ def intermediates(pk: bytes, ctx: bytes, msg: bytes, sig: bytes) -> dict:
         # A_hat[0][0], 256 coefficients as 3-byte big-endian words.
         "a00": hx(b"".join(x.to_bytes(3, "big") for x in a_hat[0, 0].coeffs)),
     }
+
+
+def precompute_blob(pk: bytes) -> bytes:
+    """tr || A_hat (30 polys) || NTT(t1 * 2^d) mod q (6 polys); 3-byte BE coefficients."""
+    d = ML_DSA_65
+    rho, t1 = d._unpack_pk(pk)
+    a_hat = d._expand_matrix_from_seed(rho)
+    t_hat = t1.scale(1 << d.d).to_ntt()
+    pack = lambda poly: b"".join((c % Q).to_bytes(3, "big") for c in poly.coeffs)
+    out = d._h(pk, 64)
+    out += b"".join(pack(a_hat[i, j]) for i in range(K) for j in range(L))
+    out += b"".join(pack(t_hat[i, 0]) for i in range(K))
+    assert len(out) == 27712
+    return out
 
 
 def differential() -> dict:
@@ -196,6 +212,7 @@ def main():
     diff = differential()
     pk, msg, sig = (bytes.fromhex(diff[k][1][2:]) for k in ("pk", "msg", "sig"))
     diff["malformed"] = malformed(pk, msg, sig)
+    diff["blob1"] = hx(precompute_blob(pk))
     for name, obj in (("differential", diff), ("acvp", acvp(ip)), ("shake", shake())):
         with open(os.path.join(HERE, name + ".json"), "w") as f:
             json.dump(obj, f, indent=1)
