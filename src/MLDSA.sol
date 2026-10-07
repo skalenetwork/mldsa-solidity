@@ -1,41 +1,44 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {ParamSet, ML_DSA_44, ML_DSA_65} from "./IMLDSAVerifier.sol";
+import {ParamSet, ML_DSA_44, ML_DSA_65, ML_DSA_87} from "./IMLDSAVerifier.sol";
 
-/// @title MLDSA — FIPS 204 ML-DSA-44 / ML-DSA-65 signature verification in pure Solidity
+/// @title MLDSA — FIPS 204 ML-DSA-44 / -65 / -87 signature verification in pure Solidity
 /// @notice `verify` / `verifyWithContext` implement ML-DSA.Verify (FIPS 204
 ///         Algorithm 3, the "pure" external interface — NOT HashML-DSA) on top of
 ///         ML-DSA.Verify_internal (Algorithm 8), exposed as `verifyInternal`. The
 ///         parameter set is an argument (`ParamSet`, see IMLDSAVerifier.sol);
-///         ML-DSA-44 is the default, ML-DSA-65 the stronger option.
+///         ML-DSA-44 is the default, ML-DSA-65 the stronger option and ML-DSA-87
+///         (NIST category 5) the strongest, opt-in.
 ///         Every malformed input — an unknown set, wrong lengths for the set, an
 ///         over-long context, a hint encoding Algorithm 21 rejects,
 ///         ||z||∞ ≥ γ1 − β — yields `false`; the library never reverts on
 ///         attacker-controlled bytes.
 ///         `precompute` + `verifyPrecomputed` split off the per-key work (tr, Â and
 ///         NTT(t1·2^d)); `MLDSAKeyFactory` stores it in data contracts.
-/// @dev    Parameter sets (FIPS 204, Table 1), q = 8380417, d = 13 for both:
+/// @dev    Parameter sets (FIPS 204, Table 1), q = 8380417, d = 13 for all three:
 ///
-///                        ML-DSA-44            ML-DSA-65
-///           (k, ℓ)       (4, 4)               (6, 5)
-///           η, τ, β      2, 39, 78            4, 49, 196
-///           λ, |c̃|       128, 32 bytes        192, 48 bytes
-///           γ1           2^17 (z: 18 bits)    2^19 (z: 20 bits)
-///           γ2           (q − 1)/88           (q − 1)/32
-///           w1           [0, 43], 6 bits      [0, 15], 4 bits
-///           ω            80                   55
-///           pk           1312 = 32 + 4·320    1952 = 32 + 6·320
-///           σ            2420 = 32+4·576+84   3309 = 48+5·640+61
+///                        ML-DSA-44            ML-DSA-65            ML-DSA-87
+///           (k, ℓ)       (4, 4)               (6, 5)               (8, 7)
+///           η, τ, β      2, 39, 78            4, 49, 196           2, 60, 120
+///           λ, |c̃|       128, 32 bytes        192, 48 bytes        256, 64 bytes
+///           γ1           2^17 (z: 18 bits)    2^19 (z: 20 bits)    2^19 (z: 20 bits)
+///           γ2           (q − 1)/88           (q − 1)/32           (q − 1)/32
+///           w1           [0, 43], 6 bits      [0, 15], 4 bits      [0, 15], 4 bits
+///           ω            80                   55                   75
+///           pk           1312 = 32 + 4·320    1952 = 32 + 6·320    2592 = 32 + 8·320
+///           σ            2420 = 32+4·576+84   3309 = 48+5·640+61   4627 = 64+7·640+83
 ///
-///         ONE copy of the code serves both sets: the Keccak sponge, the NTTs,
+///         ONE copy of the code serves every set: the Keccak sponge, the NTTs,
 ///         ExpandA/SampleInBall and t1 decoding are set-independent and take
 ///         (k, ℓ, τ, |c̃|, ω) as plain arguments in their outer loops. Only the
-///         per-coefficient leaves that embed γ1 or γ2 — z decoding (`decodeZ`) and
-///         UseHint + w1Encode (`useHintPack`) — exist twice, as constant-only Yul
-///         bodies picked by one branch, so no parameter is read in a hot loop.
-///         (One copy is also what keeps a contract that handles both sets — the
-///         key factory, `MLDSAVerifier` — under EIP-170's 24,576 bytes.)
+///         per-coefficient leaves that embed γ1, γ2 or β are specialised, as
+///         constant-only Yul bodies picked by one branch, so no parameter is read
+///         in a hot loop: z decoding (`decodeZ`, three bodies — 65 and 87 share γ1
+///         but not β, |c̃| or ℓ) and UseHint + w1Encode (`useHintPack`, two bodies
+///         — 65 and 87 share γ2). (One copy is also what keeps a contract that
+///         handles every set — the key factory, `MLDSAVerifier` — under EIP-170's
+///         24,576 bytes.)
 ///
 ///         Verification computes, row by row (i = 0..k−1),
 ///             w′_i = NTT⁻¹( Σ_j Â[i][j]∘ẑ_j − ĉ∘NTT(t1_i)·2^d )
@@ -68,15 +71,19 @@ library MLDSA {
     uint256 internal constant SIG_BYTES_44 = 2420; // 32 + ℓ·576 + ω + k
     uint256 internal constant PK_BYTES_65 = 1952;
     uint256 internal constant SIG_BYTES_65 = 3309; // 48 + ℓ·640 + ω + k
-    uint256 internal constant T1_POLY_BYTES = 320; // 32·10, both sets
+    uint256 internal constant PK_BYTES_87 = 2592;
+    uint256 internal constant SIG_BYTES_87 = 4627; // 64 + ℓ·640 + ω + k
+    uint256 internal constant T1_POLY_BYTES = 320; // 32·10, every set
 
     /// @dev The largest k of the supported sets: `hintBitUnpack`'s output size.
-    uint256 internal constant MAX_K = 6;
+    uint256 internal constant MAX_K = 8;
 
     /// @notice What the code needs of a parameter set. Only outer loops and
-    ///         offsets read it; the γ1/γ2 leaves are selected by `is65`.
+    ///         offsets read it; the γ1/γ2/β leaves are selected by `set` (decodeZ)
+    ///         and `w1Nibbles` (useHintPack).
     struct Params {
-        bool is65; //            ML-DSA-65 (else ML-DSA-44): selects decodeZ / useHintPack bodies
+        ParamSet set; //         selects the decodeZ body
+        bool w1Nibbles; //       γ2 = (q − 1)/32, w1 in 4 bits (65, 87); else (q − 1)/88, 6 bits (44)
         uint256 k;
         uint256 l;
         uint256 tau;
@@ -88,32 +95,38 @@ library MLDSA {
         uint256 sigBytes;
         uint256 aHatBytes; //    k·ℓ·768 (precompute layout below)
         uint256 tHatBytes; //    k·768
+        uint256 aParts; //       data contracts Â is split into (EIP-170): 1, 1, 2
     }
 
     /// @notice The parameters of `set`; ok = false for an id this library does not
     ///         implement (every entry point then returns false / empty).
     function params(ParamSet set) internal pure returns (bool ok, Params memory p) {
         if (set == ML_DSA_44) {
-            p = Params(false, 4, 4, 39, 80, 32, 576, 192, PK_BYTES_44, SIG_BYTES_44, 12288, 3072);
+            p = Params(set, false, 4, 4, 39, 80, 32, 576, 192, PK_BYTES_44, SIG_BYTES_44, 12288, 3072, 1);
             ok = true;
         } else if (set == ML_DSA_65) {
-            p = Params(true, 6, 5, 49, 55, 48, 640, 128, PK_BYTES_65, SIG_BYTES_65, 23040, 4608);
+            p = Params(set, true, 6, 5, 49, 55, 48, 640, 128, PK_BYTES_65, SIG_BYTES_65, 23040, 4608, 1);
+            ok = true;
+        } else if (set == ML_DSA_87) {
+            p = Params(set, true, 8, 7, 60, 75, 64, 640, 128, PK_BYTES_87, SIG_BYTES_87, 43008, 6144, 2);
             ok = true;
         }
     }
 
     function supported(ParamSet set) internal pure returns (bool) {
-        return set == ML_DSA_44 || set == ML_DSA_65;
+        return set == ML_DSA_44 || set == ML_DSA_65 || set == ML_DSA_87;
     }
 
     /// @notice FIPS 204 public-key length of `set`; 0 for an unknown set.
     function publicKeyBytes(ParamSet set) internal pure returns (uint256) {
-        return set == ML_DSA_44 ? PK_BYTES_44 : set == ML_DSA_65 ? PK_BYTES_65 : 0;
+        return set == ML_DSA_44 ? PK_BYTES_44 : set == ML_DSA_65 ? PK_BYTES_65 : set == ML_DSA_87 ? PK_BYTES_87 : 0;
     }
 
     /// @notice FIPS 204 signature length of `set`; 0 for an unknown set.
     function signatureBytes(ParamSet set) internal pure returns (uint256) {
-        return set == ML_DSA_44 ? SIG_BYTES_44 : set == ML_DSA_65 ? SIG_BYTES_65 : 0;
+        return set == ML_DSA_44
+            ? SIG_BYTES_44
+            : set == ML_DSA_65 ? SIG_BYTES_65 : set == ML_DSA_87 ? SIG_BYTES_87 : 0;
     }
 
     /// @dev SHAKE rates in bytes (FIPS 202; the SHAKE domain/pad byte 0x1F is in `absorb`).
@@ -142,8 +155,12 @@ library MLDSA {
     ///      with A = aHatBytes, T = tHatBytes:
     ///        ML-DSA-44:  A = 16·768 = 12288, T = 4·768 = 3072, total 15424
     ///        ML-DSA-65:  A = 30·768 = 23040, T = 6·768 = 4608, total 27712
+    ///        ML-DSA-87:  A = 56·768 = 43008, T = 8·768 = 6144, total 49216
     ///      65's total exceeds EIP-170 (24576), so `MLDSAKeyFactory` stores Â and
-    ///      tr ‖ t̂ in two data contracts (for both sets, uniformly).
+    ///      tr ‖ t̂ in separate data contracts (for every set, uniformly); 87's Â
+    ///      alone exceeds it too, so it is cut into `aParts` = 2 parts of k/2 rows
+    ///      (rows 0..3 and 4..7: 28 polynomials, 21,504 bytes each), the Â layout
+    ///      being their concatenation (`precomputeAPart`).
     uint256 internal constant TR_BYTES = 64;
     uint256 private constant A_HAT_OFFSET = 64;
 
@@ -210,6 +227,23 @@ library MLDSA {
         _writeAHat(p, newKeccakWorkspace(), publicKey, _ptr(aHat));
     }
 
+    /// @notice Part `part` of `precomputeA`: rows [part·k/aParts, (part+1)·k/aParts)
+    ///         of Â, i.e. bytes [part·aHatBytes/aParts, (part+1)·aHatBytes/aParts)
+    ///         of it. Empty for an unknown set, a wrongly-sized key or part ≥ aParts.
+    /// @dev    For 87 each part is 28 SHAKE128 streams — seven whole 4-way batches,
+    ///         so a part never shares a batch with the other. Computing one part at
+    ///         a time also halves the peak memory (28 strided polynomials, not 56).
+    function precomputeAPart(ParamSet set, bytes memory publicKey, uint256 part)
+        internal
+        pure
+        returns (bytes memory aPart)
+    {
+        (bool ok, Params memory p) = params(set);
+        if (!ok || publicKey.length != p.pkBytes || part >= p.aParts) return aPart;
+        aPart = new bytes(p.aHatBytes / p.aParts);
+        _writeAHatPart(p, newKeccakWorkspace(), publicKey, part, _ptr(aPart));
+    }
+
     /// @notice The tr ‖ t̂ parts of `precompute` (TR_BYTES + tHatBytes). Empty for
     ///         an unknown set or a wrongly-sized key.
     function precomputeT(ParamSet set, bytes memory publicKey) internal pure returns (bytes memory trTHat) {
@@ -229,20 +263,45 @@ library MLDSA {
         }
     }
 
-    /// @dev Â = ExpandA(ρ), packed → aHatBytes at `out`.
+    /// @dev Â = ExpandA(ρ), packed → aHatBytes at `out`, one part after another.
+    ///      A part's sampling buffers are dead once it is packed into `out`, so the
+    ///      free-memory pointer is wound back after each: the next part reuses the
+    ///      memory (Solidity zero-fills every allocation, so reuse is clean) and
+    ///      peak memory is one part's, not the whole matrix's.
     function _writeAHat(Params memory p, uint256 ks, bytes memory publicKey, uint256 out) private pure {
+        uint256 partBytes = p.aHatBytes / p.aParts;
+        for (uint256 part; part < p.aParts; ++part) {
+            uint256 fmp;
+            assembly ("memory-safe") {
+                fmp := mload(0x40)
+            }
+            _writeAHatPart(p, ks, publicKey, part, out + part * partBytes);
+            assembly ("memory-safe") {
+                mstore(0x40, fmp)
+            }
+        }
+    }
+
+    /// @dev Rows [part·k/aParts, (part+1)·k/aParts) of Â, packed at `out`: the
+    ///      SHAKE128 streams m ∈ [part·S, (part+1)·S), S = k·ℓ/aParts. Requires
+    ///      S ≡ 0 (mod 4) whenever aParts > 1 (87: S = 28), so that the part's
+    ///      streams are whole 4-way batches.
+    function _writeAHatPart(Params memory p, uint256 ks, bytes memory publicKey, uint256 part, uint256 out)
+        private
+        pure
+    {
         bytes32 rho;
         assembly ("memory-safe") {
             rho := mload(add(publicKey, 0x20))
         }
-        uint256 kl = p.k * p.l;
-        uint256 polys = _allocStrided(kl);
+        uint256 streams = p.k * p.l / p.aParts;
+        uint256 polys = _allocStrided(streams);
         uint256 ones = _allocStrided(1); // sample against z ≡ 1: acc = Â[i][j] itself
         assembly ("memory-safe") {
             for { let x := ones } lt(x, add(ones, ACC_STRIDE)) { x := add(x, 0x20) } { mstore(x, 1) }
         }
-        sampleMatrix(ks, rho, ones, 0, polys, false, p.k, p.l);
-        for (uint256 m; m < kl; ++m) {
+        sampleStreams(ks, rho, ones, 0, polys, false, p.l, part * streams, (part + 1) * streams);
+        for (uint256 m; m < streams; ++m) {
             _pack3(polys + m * ACC_STRIDE, out + m * 768);
         }
     }
@@ -394,7 +453,7 @@ library MLDSA {
         }
         _finishRows(p, accs, zp, hints, _ptr(w1Buf) + 64);
 
-        // c̃′ ← H(μ ‖ w1Encode(w1′), λ/4) and compare with c̃ (32 or 48 bytes).
+        // c̃′ ← H(μ ‖ w1Encode(w1′), λ/4) and compare with c̃ (32, 48 or 64 bytes).
         (bytes32 c0, bytes32 c1) = shake256To64(ks, _ptr(w1Buf), w1Len);
         uint256 cLen = p.cTildeBytes;
         bool same;
@@ -405,6 +464,7 @@ library MLDSA {
                 let hi := not(sub(shl(128, 1), 1)) // top 16 bytes: c̃ is 48 = 32 + 16 bytes
                 same := and(same, eq(and(c1, hi), and(mload(add(s, 0x20)), hi)))
             }
+            if eq(cLen, 64) { same := and(same, eq(c1, mload(add(s, 0x20)))) } // c̃ is 64 = 32 + 32 bytes
         }
         return same;
     }
@@ -416,12 +476,12 @@ library MLDSA {
         private
         pure
     {
-        bool is65 = p.is65;
+        bool w1Nibbles = p.w1Nibbles;
         uint256 w1PolyBytes = p.w1PolyBytes;
         for (uint256 i; i < p.k; ++i) {
             uint256 acc = accs + i * ACC_STRIDE;
             invNtt(acc, zp);
-            useHintPack(is65, acc, hints[i], w1Out + i * w1PolyBytes);
+            useHintPack(w1Nibbles, acc, hints[i], w1Out + i * w1PolyBytes);
         }
     }
 
@@ -443,9 +503,9 @@ library MLDSA {
     {
         uint256 k = p.k;
         uint256 omega = p.omega;
-        uint256 yOff = p.cTildeBytes + p.l * p.zPolyBytes; // 32 + 4·576 / 48 + 5·640
+        uint256 yOff = p.cTildeBytes + p.l * p.zPolyBytes; // 32 + 4·576 / 48 + 5·640 / 64 + 7·640
         assembly ("memory-safe") {
-            // y = the ω + k byte hint encoding (84 / 61 bytes)
+            // y = the ω + k byte hint encoding (84 / 61 / 83 bytes)
             let y := add(add(signature, 0x20), yOff)
             ok := 1
             let index := 0
@@ -488,7 +548,9 @@ library MLDSA {
     ///         field. |z| < γ1 − β ⇔ β < r < 2γ1 − β; the residue is
     ///         q + γ1 − r ∈ (q − γ1, q + γ1), which the NTT accepts as is.
     function decodeZ(Params memory p, bytes memory signature, uint256 out) internal pure returns (bool) {
-        return p.is65 ? _decodeZ65(signature, out) : _decodeZ44(signature, out);
+        if (p.set == ML_DSA_44) return _decodeZ44(signature, out);
+        if (p.set == ML_DSA_65) return _decodeZ65(signature, out);
+        return _decodeZ87(signature, out);
     }
 
     /// @dev ML-DSA-44: z at σ[32 .. 2336), 18-bit fields, four per 9 bytes;
@@ -545,6 +607,27 @@ library MLDSA {
         }
     }
 
+    /// @dev ML-DSA-87: z at σ[64 .. 4544), 20-bit fields, two per 5 bytes;
+    ///      γ1 = 2^19 (as 65), β = 120.
+    function _decodeZ87(bytes memory signature, uint256 out) private pure returns (bool ok) {
+        assembly ("memory-safe") {
+            let src := add(signature, add(0x20, 64))
+            let end := add(out, mul(0x2000, 7))
+            ok := 1
+            for {} lt(out, end) { out := add(out, 0x40) } {
+                let w := mload(src)
+                let b2 := byte(2, w)
+                let r0 := or(or(byte(0, w), shl(8, byte(1, w))), shl(16, and(b2, 0x0f)))
+                let r1 := or(or(shr(4, b2), shl(4, byte(3, w))), shl(12, byte(4, w)))
+                // β < r < 2γ1 − β  (2γ1 − β = 1048456)
+                ok := and(ok, and(and(gt(r0, 120), lt(r0, 1048456)), and(gt(r1, 120), lt(r1, 1048456))))
+                mstore(out, sub(8904705, r0)) //          q + γ1 = 8904705
+                mstore(add(out, 0x20), sub(8904705, r1))
+                src := add(src, 5)
+            }
+        }
+    }
+
     /// @notice t1_i ← SimpleBitUnpack of row i of pk (10-bit little-endian fields,
     ///         four per 5 bytes) into the polynomial at `out`.
     function decodeT1(bytes memory publicKey, uint256 i, uint256 out) internal pure {
@@ -567,9 +650,9 @@ library MLDSA {
 
     // ── Sampling (FIPS 204 §7.3) ─────────────────────────────────────────────
 
-    /// @notice SampleInBall (Algorithm 29): c with τ coefficients ±1 (39 / 49),
+    /// @notice SampleInBall (Algorithm 29): c with τ coefficients ±1 (39 / 49 / 60),
     ///         written as residues (1 or q − 1) into the zeroed polynomial at `c`.
-    /// @dev    Absorbs ALL λ/4 bytes of c̃ (32 / 48; final FIPS 204 — the draft
+    /// @dev    Absorbs ALL λ/4 bytes of c̃ (32 / 48 / 64; final FIPS 204 — the draft
     ///         used 32 for every set). The first 8 squeezed bytes are the sign bits
     ///         (τ ≤ 64) — exactly Keccak lane 0, little-endian — then one byte per
     ///         draw, rejecting j > i.
@@ -612,7 +695,7 @@ library MLDSA {
         }
     }
 
-    /// @notice The k·ℓ RejNTTPoly streams of ExpandA (Algorithms 30 & 32; 16 / 30),
+    /// @notice The k·ℓ RejNTTPoly streams of ExpandA (Algorithms 30 & 32; 16 / 30 / 56),
     ///         Â[i][j] = RejNTTPoly(ρ ‖ IntegerToBytes(j,1) ‖ IntegerToBytes(i,1)),
     ///         run four at a time on the 4-way permutation. Each accepted
     ///         coefficient a of Â[i][j] at position n does
@@ -636,15 +719,31 @@ library MLDSA {
         uint256 k,
         uint256 l
     ) internal pure {
-        // Small bounded integers only (k·ℓ ≤ 30 streams, offsets < 2^14).
+        sampleStreams(ks, rho, zBase, zStride, accBase, perRow, l, 0, k * l);
+    }
+
+    /// @notice `sampleMatrix` restricted to the streams m ∈ [from, to) (m = ℓi + j);
+    ///         `from` must be a multiple of 4 (a batch boundary). With `!perRow`,
+    ///         stream m's polynomial is the (m − from)-th at accBase.
+    function sampleStreams(
+        uint256 ks,
+        bytes32 rho,
+        uint256 zBase,
+        uint256 zStride,
+        uint256 accBase,
+        bool perRow,
+        uint256 l,
+        uint256 from,
+        uint256 to
+    ) internal pure {
+        // Small bounded integers only (k·ℓ ≤ 56 streams, offsets < 2^14).
         unchecked {
-            uint256 streams = k * l;
-            for (uint256 b; 4 * b < streams; ++b) {
+            for (uint256 b = from / 4; 4 * b < to; ++b) {
                 // n_s (byte offset of the next coefficient) of the four slots, packed
-                // 16 bits each; an unused slot (stream ≥ k·ℓ) starts finished.
+                // 16 bits each; an unused slot (stream ≥ to) starts finished.
                 uint256 ns;
                 for (uint256 s; s < 4; ++s) {
-                    if (4 * b + s >= streams) ns |= 0x2000 << (16 * s);
+                    if (4 * b + s >= to) ns |= 0x2000 << (16 * s);
                 }
                 _initBatch(ks, rho, b, l);
                 while (true) {
@@ -654,7 +753,7 @@ library MLDSA {
                         uint256 n = (ns >> (16 * s)) & 0xffff;
                         if (n >= 0x2000) continue;
                         uint256 m = 4 * b + s; // stream index ℓi + j
-                        uint256 acc = accBase + (perRow ? m / l : m) * ACC_STRIDE;
+                        uint256 acc = accBase + (perRow ? m / l : m - from) * ACC_STRIDE;
                         n = _drainSlot(ks, s, n, zBase + (m % l) * zStride, acc);
                         ns = (ns & ~(0xffff << (16 * s))) | (n << (16 * s));
                         if (n < 0x2000) allDone = false;
@@ -1030,8 +1129,8 @@ library MLDSA {
     ///         to r1 = 0 with r0 − 1 < 0 — reducing r1 mod m and testing
     ///         "r0 > 0 ⇔ 1 ≤ r0′ ≤ γ2" on the unadjusted r0 give exactly that. With
     ///         hint: r1 + 1 mod m if r0 > 0, else r1 − 1 mod m.
-    function useHintPack(bool is65, uint256 w, uint256 hintBits, uint256 out) internal pure {
-        if (is65) _useHintPack65(w, hintBits, out);
+    function useHintPack(bool w1Nibbles, uint256 w, uint256 hintBits, uint256 out) internal pure {
+        if (w1Nibbles) _useHintPack65(w, hintBits, out);
         else _useHintPack44(w, hintBits, out);
     }
 
@@ -1064,8 +1163,9 @@ library MLDSA {
         }
     }
 
-    /// @dev ML-DSA-65: 2γ2 = 523776, m = 16 (so mod m is `& 15`), w1 ∈ [0, 15]
-    ///      packed 4 bits per coefficient, low nibble first, into 128 bytes.
+    /// @dev ML-DSA-65 and ML-DSA-87 (same γ2): 2γ2 = 523776, m = 16 (so mod m is
+    ///      `& 15`), w1 ∈ [0, 15] packed 4 bits per coefficient, low nibble first,
+    ///      into 128 bytes.
     function _useHintPack65(uint256 w, uint256 hintBits, uint256 out) private pure {
         assembly ("memory-safe") {
             for { let n := 0 } lt(n, 256) {} {
@@ -1423,7 +1523,7 @@ library MLDSA {
     /// @notice μ = SHAKE256(src[0..len)) truncated to 64 bytes (returned, from slot 0)
     ///         AND SampleInBall's sponge SHAKE256(c̃) absorbed into slot 1 — in the
     ///         same final permutation. The two hashes are independent and c̃
-    ///         (32 / 48 bytes) fits one SHAKE256 block, so riding along in an unused
+    ///         (32 / 48 / 64 bytes) fits one SHAKE256 block, so riding along in an unused
     ///         slot of the 4-way permutation saves SampleInBall's own permutation.
     ///         Call `sampleInBall(…, 1)` next, before anything else uses `ks`.
     /// @dev    Slot 1 is cleared first: after a multi-block μ input it holds

@@ -8,9 +8,10 @@ import {MLDSA} from "./MLDSA.sol";
 import {MLDSAKeys} from "./MLDSAKeyFactory.sol";
 
 /// @title MLDSAVerifier — this repository's IMLDSAVerifier, in pure Solidity
-/// @notice ML-DSA-44 and ML-DSA-65 (FIPS 204 pure ML-DSA.Verify, empty context).
-///         For a key whose per-key data is in the (immutable) `FACTORY` under the
-///         given set — both data contracts deployed — it verifies against that
+/// @notice ML-DSA-44, ML-DSA-65 and ML-DSA-87 (FIPS 204 pure ML-DSA.Verify, empty
+///         context). For a key whose per-key data is in the (immutable) `FACTORY`
+///         under the given set — all its data contracts deployed (T and every A
+///         part: one for 44 / 65, two for 87) — it verifies against that
 ///         precomputation (fast path); for any other key it runs the full
 ///         verification from the key itself (fallback). Precomputation is purely a
 ///         gas optimization: both paths compute the same function, so the answer

@@ -185,7 +185,8 @@ contract MLDSAVerifierTest is Test {
     function test_interface_supportsAndErc165() public {
         assertTrue(fast.supportsParamSet(ML_DSA_44));
         assertTrue(fast.supportsParamSet(ML_DSA_65));
-        assertFalse(fast.supportsParamSet(ParamSet.wrap(2)));
+        assertTrue(fast.supportsParamSet(ParamSet.wrap(2))); // ML-DSA-87
+        assertFalse(fast.supportsParamSet(ParamSet.wrap(3)));
         assertFalse(fast.supportsParamSet(ParamSet.wrap(255)));
         assertTrue(fast.supportsInterface(type(IMLDSAVerifier).interfaceId));
         assertTrue(fast.supportsInterface(type(IERC165).interfaceId));
@@ -336,7 +337,7 @@ contract MLDSAVerifierTest is Test {
             assertFalse(v.verify(ML_DSA_44, pk6[1], m6[1], s6[1]), "65 under 44");
             assertFalse(v.verify(ML_DSA_44, pk4[1], m6[1], s6[1]), "65 sig, 44 key");
             assertFalse(v.verify(ML_DSA_65, pk6[1], m4[1], s4[1]), "44 sig, 65 key");
-            assertFalse(v.verify(ParamSet.wrap(2), pk4[1], m4[1], s4[1]), "unknown set");
+            assertFalse(v.verify(ParamSet.wrap(3), pk4[1], m4[1], s4[1]), "unknown set");
             assertFalse(v.verify(ML_DSA_44, "", m4[1], s4[1]), "empty pk");
             assertFalse(v.verify(ML_DSA_44, pk4[1], m4[1], ""), "empty sig");
             assertFalse(v.verify(ML_DSA_44, abi.encodePacked(pk4[1], bytes1(0)), m4[1], s4[1]), "long pk");

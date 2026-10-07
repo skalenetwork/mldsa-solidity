@@ -6,15 +6,17 @@ import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 /// @notice An ML-DSA parameter set (FIPS 204, Table 1), as a uint8 id:
 ///           0  ML-DSA-44  (the default — the zero value)
 ///           1  ML-DSA-65
+///           2  ML-DSA-87  (opt-in: NIST category 5)
 ///         Any other id is unknown: `supportsParamSet` answers false and `verify` false.
 ///         A uint8 rather than an enum on purpose: an enum argument outside the
 ///         declared range makes the ABI decoder REVERT, while an unknown id here is
-///         an ordinary "no" — and a later set (ML-DSA-87 would be 2) fits without
-///         changing the type or any selector (enums and uint8 encode identically).
+///         an ordinary "no" — and a later set fits without changing the type or any
+///         selector (enums and uint8 encode identically); ML-DSA-87 came in that way.
 type ParamSet is uint8;
 
 ParamSet constant ML_DSA_44 = ParamSet.wrap(0);
 ParamSet constant ML_DSA_65 = ParamSet.wrap(1);
+ParamSet constant ML_DSA_87 = ParamSet.wrap(2);
 
 function _paramSetEq(ParamSet a, ParamSet b) pure returns (bool) {
     return ParamSet.unwrap(a) == ParamSet.unwrap(b);

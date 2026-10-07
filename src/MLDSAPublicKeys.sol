@@ -2,11 +2,12 @@
 pragma solidity ^0.8.24;
 
 /// @title MLDSAPublicKeys — keep an ML-DSA public key as contract code
-/// @notice A 1,312-byte (ML-DSA-44) or 1,952-byte (ML-DSA-65) key is far cheaper to
-///         keep as the code of a data contract (written once, ~200 gas/byte, read
-///         with EXTCODECOPY at 3 gas/word) than in storage (~20k gas per 32 bytes to
-///         write, 2.1k per cold word to read). A wallet stores the returned address
-///         (e.g. as an immutable) and hands `load(addr)` to IMLDSAVerifier.verify.
+/// @notice A 1,312-byte (ML-DSA-44), 1,952-byte (ML-DSA-65) or 2,592-byte (ML-DSA-87)
+///         key is far cheaper to keep as the code of a data contract (written once,
+///         ~200 gas/byte, read with EXTCODECOPY at 3 gas/word) than in storage (~20k
+///         gas per 32 bytes to write, 2.1k per cold word to read). A wallet stores
+///         the returned address (e.g. as an immutable) and hands `load(addr)` to
+///         IMLDSAVerifier.verify.
 /// @dev    SSTORE2 layout: runtime = 0x00 ‖ pk. The leading STOP makes the data
 ///         contract uncallable, and it is REQUIRED, not cosmetic: pk starts with
 ///         the random seed ρ, and EIP-3541 rejects new code whose first byte is

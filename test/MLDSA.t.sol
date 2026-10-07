@@ -104,7 +104,7 @@ contract MLDSAHarness {
         (, MLDSA.Params memory p) = MLDSA.params(set);
         uint256 t0 = gasleft();
         uint256 t = t0;
-        (, uint256[6] memory hints) = MLDSA.hintBitUnpack(p, sig);
+        (, uint256[8] memory hints) = MLDSA.hintBitUnpack(p, sig);
         uint256 zHat = MLDSA._allocWords(p.l * 256 + 8);
         MLDSA.decodeZ(p, sig, zHat);
         uint256 zp = MLDSA._ptr(MLDSA._zetas());
@@ -167,7 +167,7 @@ contract MLDSAHarness {
         (, MLDSA.Params memory p) = MLDSA.params(set);
         uint256 t0 = gasleft();
         uint256 t = t0;
-        (, uint256[6] memory hints) = MLDSA.hintBitUnpack(p, sig);
+        (, uint256[8] memory hints) = MLDSA.hintBitUnpack(p, sig);
         uint256 zHat = MLDSA._allocWords(p.l * 256 + 8);
         MLDSA.decodeZ(p, sig, zHat);
         uint256 zp = MLDSA._ptr(MLDSA._zetas());
@@ -221,12 +221,12 @@ contract MLDSAHarness {
         w1Out = _w1Part(w1Buf, w1Len);
     }
 
-    function _useHintRows(MLDSA.Params memory p, uint256 acc, uint256[6] memory hints, bytes memory w1Buf)
+    function _useHintRows(MLDSA.Params memory p, uint256 acc, uint256[8] memory hints, bytes memory w1Buf)
         private
         pure
     {
         for (uint256 i; i < p.k; ++i) {
-            MLDSA.useHintPack(p.is65, acc + i * 0x2100, hints[i], MLDSA._ptr(w1Buf) + 64 + i * p.w1PolyBytes);
+            MLDSA.useHintPack(p.w1Nibbles, acc + i * 0x2100, hints[i], MLDSA._ptr(w1Buf) + 64 + i * p.w1PolyBytes);
         }
     }
 
@@ -396,9 +396,9 @@ contract MLDSATest is Test {
             assertEq(MLDSA.publicKeyBytes(sets[n]), pkLen[n]);
             assertEq(MLDSA.signatureBytes(sets[n]), sigLen[n]);
         }
-        (bool ok2,) = MLDSA.params(ParamSet.wrap(2));
+        (bool ok2,) = MLDSA.params(ParamSet.wrap(3));
         assertFalse(ok2, "unknown set");
-        assertFalse(MLDSA.supported(ParamSet.wrap(2)));
+        assertFalse(MLDSA.supported(ParamSet.wrap(3)));
         assertEq(MLDSA.publicKeyBytes(ParamSet.wrap(255)), 0);
     }
 
@@ -641,7 +641,7 @@ contract MLDSATest is Test {
         assertFalse(h.verify(set, pk, m, ""), "empty sig");
         assertFalse(h.verifyWithContext(set, pk, new bytes(256), m, sig), "ctx > 255");
         // Unknown parameter-set ids: false (and empty precomputation), no revert.
-        for (uint256 id = 2; id < 256; id += 51) {
+        for (uint256 id = 3; id < 256; id += 51) {
             assertFalse(h.verify(ParamSet.wrap(uint8(id)), pk, m, sig), "unknown set");
             assertEq(h.precompute(ParamSet.wrap(uint8(id)), pk).length, 0, "unknown set precompute");
         }
@@ -990,12 +990,12 @@ contract MLDSATest is Test {
         factory.registerT(set, abi.encodePacked(f.pk[1], bytes1(0)));
         // Unknown set: registration reverts, everything else is a plain "no".
         vm.expectRevert(MLDSAKeyFactory.UnsupportedParamSet.selector);
-        factory.registerA(ParamSet.wrap(2), f.pk[1]);
+        factory.registerA(ParamSet.wrap(3), f.pk[1]);
         vm.expectRevert(MLDSAKeyFactory.UnsupportedParamSet.selector);
-        factory.registerT(ParamSet.wrap(2), f.pk[1]);
-        assertFalse(factory.isRegistered(ParamSet.wrap(2), h1));
-        assertEq(factory.load(ParamSet.wrap(2), h1).length, 0);
-        assertFalse(factory.verify(ParamSet.wrap(2), h1, f.msg[1], f.sig[1]));
+        factory.registerT(ParamSet.wrap(3), f.pk[1]);
+        assertFalse(factory.isRegistered(ParamSet.wrap(3), h1));
+        assertEq(factory.load(ParamSet.wrap(3), h1).length, 0);
+        assertFalse(factory.verify(ParamSet.wrap(3), h1, f.msg[1], f.sig[1]));
     }
 
     /// The set is part of the salt: a key registered under its set is not found
