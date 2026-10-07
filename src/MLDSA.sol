@@ -1,23 +1,45 @@
 // SPDX-License-Identifier: LGPL-3.0-only
 pragma solidity ^0.8.24;
 
-/// @title MLDSA65 — FIPS 204 ML-DSA-65 signature verification in pure Solidity
+import {ParamSet, ML_DSA_44, ML_DSA_65} from "./IMLDSAVerifier.sol";
+
+/// @title MLDSA — FIPS 204 ML-DSA-44 / ML-DSA-65 signature verification in pure Solidity
 /// @notice `verify` / `verifyWithContext` implement ML-DSA.Verify (FIPS 204
 ///         Algorithm 3, the "pure" external interface — NOT HashML-DSA) on top of
-///         ML-DSA.Verify_internal (Algorithm 8), exposed as `verifyInternal`.
-///         Every malformed input — wrong lengths, an over-long context, a hint
-///         encoding Algorithm 21 rejects, ||z||∞ ≥ γ1 − β — yields `false`; the
-///         library never reverts on attacker-controlled bytes.
+///         ML-DSA.Verify_internal (Algorithm 8), exposed as `verifyInternal`. The
+///         parameter set is an argument (`ParamSet`, see IMLDSAVerifier.sol);
+///         ML-DSA-44 is the default, ML-DSA-65 the stronger option.
+///         Every malformed input — an unknown set, wrong lengths for the set, an
+///         over-long context, a hint encoding Algorithm 21 rejects,
+///         ||z||∞ ≥ γ1 − β — yields `false`; the library never reverts on
+///         attacker-controlled bytes.
 ///         `precompute` + `verifyPrecomputed` split off the per-key work (tr, Â and
-///         NTT(t1·2^d)); `MLDSA65KeyFactory` stores it in data contracts.
-/// @dev    Parameter set ML-DSA-65: q = 8380417, d = 13, τ = 49, λ = 192 (c̃ is 48
-///         bytes), γ1 = 2^19, γ2 = (q − 1)/32, (k, ℓ) = (6, 5), η = 4, β = τ·η = 196,
-///         ω = 55. pk = ρ ‖ t1 (32 + 6·320 = 1952 bytes); σ = c̃ ‖ z ‖ h
-///         (48 + 5·640 + 61 = 3309 bytes).
+///         NTT(t1·2^d)); `MLDSAKeyFactory` stores it in data contracts.
+/// @dev    Parameter sets (FIPS 204, Table 1), q = 8380417, d = 13 for both:
+///
+///                        ML-DSA-44            ML-DSA-65
+///           (k, ℓ)       (4, 4)               (6, 5)
+///           η, τ, β      2, 39, 78            4, 49, 196
+///           λ, |c̃|       128, 32 bytes        192, 48 bytes
+///           γ1           2^17 (z: 18 bits)    2^19 (z: 20 bits)
+///           γ2           (q − 1)/88           (q − 1)/32
+///           w1           [0, 43], 6 bits      [0, 15], 4 bits
+///           ω            80                   55
+///           pk           1312 = 32 + 4·320    1952 = 32 + 6·320
+///           σ            2420 = 32+4·576+84   3309 = 48+5·640+61
+///
+///         ONE copy of the code serves both sets: the Keccak sponge, the NTTs,
+///         ExpandA/SampleInBall and t1 decoding are set-independent and take
+///         (k, ℓ, τ, |c̃|, ω) as plain arguments in their outer loops. Only the
+///         per-coefficient leaves that embed γ1 or γ2 — z decoding (`decodeZ`) and
+///         UseHint + w1Encode (`useHintPack`) — exist twice, as constant-only Yul
+///         bodies picked by one branch, so no parameter is read in a hot loop.
+///         (One copy is also what keeps a contract that handles both sets — the
+///         key factory, `MLDSAVerifier` — under EIP-170's 24,576 bytes.)
 ///
 ///         Verification computes, row by row (i = 0..k−1),
 ///             w′_i = NTT⁻¹( Σ_j Â[i][j]∘ẑ_j − ĉ∘NTT(t1_i)·2^d )
-///         then w1′ = UseHint(h, w′) and checks c̃ = H(μ ‖ w1Encode(w1′), 48) with
+///         then w1′ = UseHint(h, w′) and checks c̃ = H(μ ‖ w1Encode(w1′), λ/4) with
 ///         μ = H(tr ‖ M′, 64), tr = H(pk, 64), H = SHAKE256.
 ///
 ///         Hot paths are Yul: the Keccak-f[1600] permutation (SHAKE is NOT the
@@ -27,33 +49,72 @@ pragma solidity ^0.8.24;
 ///         accumulator the moment it is accepted, so Â is never materialised.
 ///         The permutation is 4-WAY SIMD: every word holds the same lane of four
 ///         independent Keccak instances (instance s in bits [64s, 64s + 64)), so the
-///         30 SHAKE128 streams of ExpandA run four at a time for little more than
-///         the cost of one. Single-stream hashing (SHAKE256) just uses slot 0.
+///         k·ℓ SHAKE128 streams of ExpandA run four at a time for little more than
+///         the cost of one. Single-stream hashing (SHAKE256) uses slot 0 — and
+///         SampleInBall's H(c̃) rides in slot 1 of μ's final permutation.
 ///
 ///         Memory conventions: every polynomial is 256 consecutive 32-byte words,
 ///         one coefficient per word, addressed by a raw memory pointer (`uint256`).
 ///         Coefficients are kept LAZILY reduced (a small multiple of q) inside the
 ///         NTTs; `mulmod`/`addmod` bring them back into [0, q) where it matters.
 ///         Keccak state: 25 words, one lane per word, four instances per lane.
-library MLDSA65 {
-    // ── Parameters (FIPS 204, Table 1, ML-DSA-65) ────────────────────────────
+library MLDSA {
+    // ── Parameters (FIPS 204, Table 1) ───────────────────────────────────────
 
     uint256 internal constant Q = 8380417;
     uint256 internal constant D = 13;
-    uint256 internal constant TAU = 49;
-    uint256 internal constant GAMMA1 = 1 << 19;
-    uint256 internal constant GAMMA2 = (Q - 1) / 32; // 261888
-    uint256 internal constant K = 6;
-    uint256 internal constant L = 5;
-    uint256 internal constant BETA = 196; // τ·η
-    uint256 internal constant OMEGA = 55;
 
-    uint256 internal constant C_TILDE_BYTES = 48; //  λ/4
-    uint256 internal constant PK_BYTES = 1952; //     32 + k·32·10
-    uint256 internal constant Z_POLY_BYTES = 640; //  32·20 (γ1 = 2^19 → 20 bits)
-    uint256 internal constant SIG_BYTES = 3309; //    48 + ℓ·640 + ω + k
-    uint256 internal constant T1_POLY_BYTES = 320; // 32·10
-    uint256 internal constant W1_POLY_BYTES = 128; // 32·4 (w1 ∈ [0, 15])
+    uint256 internal constant PK_BYTES_44 = 1312; //  32 + k·32·10
+    uint256 internal constant SIG_BYTES_44 = 2420; // 32 + ℓ·576 + ω + k
+    uint256 internal constant PK_BYTES_65 = 1952;
+    uint256 internal constant SIG_BYTES_65 = 3309; // 48 + ℓ·640 + ω + k
+    uint256 internal constant T1_POLY_BYTES = 320; // 32·10, both sets
+
+    /// @dev The largest k of the supported sets: `hintBitUnpack`'s output size.
+    uint256 internal constant MAX_K = 6;
+
+    /// @notice What the code needs of a parameter set. Only outer loops and
+    ///         offsets read it; the γ1/γ2 leaves are selected by `is65`.
+    struct Params {
+        bool is65; //            ML-DSA-65 (else ML-DSA-44): selects decodeZ / useHintPack bodies
+        uint256 k;
+        uint256 l;
+        uint256 tau;
+        uint256 omega;
+        uint256 cTildeBytes; //  λ/4
+        uint256 zPolyBytes; //   32·(1 + log2 γ1): 576 / 640
+        uint256 w1PolyBytes; //  32·bitlen((q − 1)/(2γ2) − 1): 192 / 128
+        uint256 pkBytes;
+        uint256 sigBytes;
+        uint256 aHatBytes; //    k·ℓ·768 (precompute layout below)
+        uint256 tHatBytes; //    k·768
+    }
+
+    /// @notice The parameters of `set`; ok = false for an id this library does not
+    ///         implement (every entry point then returns false / empty).
+    function params(ParamSet set) internal pure returns (bool ok, Params memory p) {
+        if (set == ML_DSA_44) {
+            p = Params(false, 4, 4, 39, 80, 32, 576, 192, PK_BYTES_44, SIG_BYTES_44, 12288, 3072);
+            ok = true;
+        } else if (set == ML_DSA_65) {
+            p = Params(true, 6, 5, 49, 55, 48, 640, 128, PK_BYTES_65, SIG_BYTES_65, 23040, 4608);
+            ok = true;
+        }
+    }
+
+    function supported(ParamSet set) internal pure returns (bool) {
+        return set == ML_DSA_44 || set == ML_DSA_65;
+    }
+
+    /// @notice FIPS 204 public-key length of `set`; 0 for an unknown set.
+    function publicKeyBytes(ParamSet set) internal pure returns (uint256) {
+        return set == ML_DSA_44 ? PK_BYTES_44 : set == ML_DSA_65 ? PK_BYTES_65 : 0;
+    }
+
+    /// @notice FIPS 204 signature length of `set`; 0 for an unknown set.
+    function signatureBytes(ParamSet set) internal pure returns (uint256) {
+        return set == ML_DSA_44 ? SIG_BYTES_44 : set == ML_DSA_65 ? SIG_BYTES_65 : 0;
+    }
 
     /// @dev SHAKE rates in bytes (FIPS 202; the SHAKE domain/pad byte 0x1F is in `absorb`).
     uint256 private constant RATE128 = 168;
@@ -75,117 +136,122 @@ library MLDSA65 {
     uint256 internal constant ACC_STRIDE = 0x2100;
 
     /// @dev Per-key precomputation (`precompute`), all coefficients 3 bytes big-endian:
-    ///        [0, 64)          tr = H(pk, 64)
-    ///        [64, 23104)      Â = ExpandA(ρ): k·ℓ = 30 polynomials, order [i][j][n]
-    ///        [23104, 27712)   t̂ = NTT(t1·2^d) mod q: k = 6 polynomials, order [i][n]
-    ///      27712 bytes exceed EIP-170 (24576), so `MLDSA65KeyFactory` stores Â and tr ‖ t̂
-    ///      in two data contracts.
+    ///        [0, 64)                   tr = H(pk, 64)
+    ///        [64, 64 + A)              Â = ExpandA(ρ): k·ℓ polynomials, order [i][j][n]
+    ///        [64 + A, 64 + A + T)      t̂ = NTT(t1·2^d) mod q: k polynomials, order [i][n]
+    ///      with A = aHatBytes, T = tHatBytes:
+    ///        ML-DSA-44:  A = 16·768 = 12288, T = 4·768 = 3072, total 15424
+    ///        ML-DSA-65:  A = 30·768 = 23040, T = 6·768 = 4608, total 27712
+    ///      65's total exceeds EIP-170 (24576), so `MLDSAKeyFactory` stores Â and
+    ///      tr ‖ t̂ in two data contracts (for both sets, uniformly).
     uint256 internal constant TR_BYTES = 64;
-    uint256 internal constant A_HAT_BYTES = 23040; //   30·256·3
-    uint256 internal constant T_HAT_BYTES = 4608; //    6·256·3
-    uint256 internal constant BLOB_BYTES = 27712; //    64 + 23040 + 4608
     uint256 private constant A_HAT_OFFSET = 64;
-    uint256 private constant T_HAT_OFFSET = 23104;
 
     // ── Public API ───────────────────────────────────────────────────────────
 
     /// @notice ML-DSA.Verify (Algorithm 3) with the empty context string. The
     ///         reference path: everything is derived from the public key.
-    function verify(bytes memory publicKey, bytes memory message, bytes memory signature)
+    function verify(ParamSet set, bytes memory publicKey, bytes memory message, bytes memory signature)
         internal
         view
         returns (bool)
     {
-        return verifyWithContext(publicKey, "", message, signature);
+        return verifyWithContext(set, publicKey, "", message, signature);
     }
 
     /// @notice ML-DSA.Verify (Algorithm 3): M′ = 0x00 ‖ |ctx| ‖ ctx ‖ M.
     /// @dev    A context longer than 255 bytes is an error in FIPS 204; here it is `false`.
     function verifyWithContext(
+        ParamSet set,
         bytes memory publicKey,
         bytes memory ctx,
         bytes memory message,
         bytes memory signature
     ) internal view returns (bool) {
         if (ctx.length > 255) return false;
-        return verifyInternal(publicKey, _formatMessage(ctx, message), signature);
+        return verifyInternal(set, publicKey, _formatMessage(ctx, message), signature);
     }
 
     /// @notice ML-DSA.Verify_internal (Algorithm 8) over an already-formatted M′.
     /// @dev    Exposed for the ACVP "internal interface" vectors. Callers that want
     ///         FIPS 204 domain separation must use `verify` / `verifyWithContext`.
-    function verifyInternal(bytes memory publicKey, bytes memory mPrime, bytes memory signature)
+    function verifyInternal(ParamSet set, bytes memory publicKey, bytes memory mPrime, bytes memory signature)
         internal
         view
         returns (bool)
     {
-        if (publicKey.length != PK_BYTES) return false;
-        return _verifyCore(publicKey, "", mPrime, signature);
+        (bool ok, Params memory p) = params(set);
+        if (!ok || publicKey.length != p.pkBytes) return false;
+        return _verifyCore(p, publicKey, "", mPrime, signature);
     }
 
     /// @notice Everything in Algorithm 8 that depends only on the public key, done
-    ///         once: tr = H(pk, 64), Â = ExpandA(ρ), t̂ = NTT(t1·2^d). Layout at
-    ///         BLOB_BYTES. Returns empty bytes for a wrongly-sized key.
-    /// @dev    Deterministic in pk alone, so the blob can be re-derived and compared
-    ///         by anyone; `MLDSA65KeyFactory` runs it on-chain from the key itself.
-    function precompute(bytes memory publicKey) internal pure returns (bytes memory blob) {
-        if (publicKey.length != PK_BYTES) return blob;
-        blob = new bytes(BLOB_BYTES);
+    ///         once: tr = H(pk, 64), Â = ExpandA(ρ), t̂ = NTT(t1·2^d). Layout above.
+    ///         Returns empty bytes for an unknown set or a wrongly-sized key.
+    /// @dev    Deterministic in (set, pk), so the blob can be re-derived and compared
+    ///         by anyone; `MLDSAKeyFactory` runs it on-chain from the key itself.
+    function precompute(ParamSet set, bytes memory publicKey) internal pure returns (bytes memory blob) {
+        (bool ok, Params memory p) = params(set);
+        if (!ok || publicKey.length != p.pkBytes) return blob;
+        blob = new bytes(TR_BYTES + p.aHatBytes + p.tHatBytes);
         uint256 out = _ptr(blob);
         uint256 ks = newKeccakWorkspace();
-        _writeTr(ks, publicKey, out);
-        _writeAHat(ks, publicKey, out + A_HAT_OFFSET);
-        _writeTHat(publicKey, out + T_HAT_OFFSET);
+        _writeTr(p, ks, publicKey, out);
+        _writeAHat(p, ks, publicKey, out + A_HAT_OFFSET);
+        _writeTHat(p, publicKey, out + A_HAT_OFFSET + p.aHatBytes);
     }
 
-    /// @notice The Â part of `precompute` alone (A_HAT_BYTES; depends on ρ only).
-    ///         Empty for a wrongly-sized key.
-    function precomputeA(bytes memory publicKey) internal pure returns (bytes memory aHat) {
-        if (publicKey.length != PK_BYTES) return aHat;
-        aHat = new bytes(A_HAT_BYTES);
-        _writeAHat(newKeccakWorkspace(), publicKey, _ptr(aHat));
+    /// @notice The Â part of `precompute` alone (aHatBytes; depends on ρ only).
+    ///         Empty for an unknown set or a wrongly-sized key.
+    function precomputeA(ParamSet set, bytes memory publicKey) internal pure returns (bytes memory aHat) {
+        (bool ok, Params memory p) = params(set);
+        if (!ok || publicKey.length != p.pkBytes) return aHat;
+        aHat = new bytes(p.aHatBytes);
+        _writeAHat(p, newKeccakWorkspace(), publicKey, _ptr(aHat));
     }
 
-    /// @notice The tr ‖ t̂ parts of `precompute` (TR_BYTES + T_HAT_BYTES). Empty for
-    ///         a wrongly-sized key.
-    function precomputeT(bytes memory publicKey) internal pure returns (bytes memory trTHat) {
-        if (publicKey.length != PK_BYTES) return trTHat;
-        trTHat = new bytes(TR_BYTES + T_HAT_BYTES);
-        _writeTr(newKeccakWorkspace(), publicKey, _ptr(trTHat));
-        _writeTHat(publicKey, _ptr(trTHat) + TR_BYTES);
+    /// @notice The tr ‖ t̂ parts of `precompute` (TR_BYTES + tHatBytes). Empty for
+    ///         an unknown set or a wrongly-sized key.
+    function precomputeT(ParamSet set, bytes memory publicKey) internal pure returns (bytes memory trTHat) {
+        (bool ok, Params memory p) = params(set);
+        if (!ok || publicKey.length != p.pkBytes) return trTHat;
+        trTHat = new bytes(TR_BYTES + p.tHatBytes);
+        _writeTr(p, newKeccakWorkspace(), publicKey, _ptr(trTHat));
+        _writeTHat(p, publicKey, _ptr(trTHat) + TR_BYTES);
     }
 
     /// @dev tr = H(pk, 64) → 64 bytes at `out`.
-    function _writeTr(uint256 ks, bytes memory publicKey, uint256 out) private pure {
-        (bytes32 tr0, bytes32 tr1) = shake256To64(ks, _ptr(publicKey), PK_BYTES);
+    function _writeTr(Params memory p, uint256 ks, bytes memory publicKey, uint256 out) private pure {
+        (bytes32 tr0, bytes32 tr1) = shake256To64(ks, _ptr(publicKey), p.pkBytes);
         assembly ("memory-safe") {
             mstore(out, tr0)
             mstore(add(out, 0x20), tr1)
         }
     }
 
-    /// @dev Â = ExpandA(ρ), packed → A_HAT_BYTES at `out`.
-    function _writeAHat(uint256 ks, bytes memory publicKey, uint256 out) private pure {
+    /// @dev Â = ExpandA(ρ), packed → aHatBytes at `out`.
+    function _writeAHat(Params memory p, uint256 ks, bytes memory publicKey, uint256 out) private pure {
         bytes32 rho;
         assembly ("memory-safe") {
             rho := mload(add(publicKey, 0x20))
         }
-        uint256 polys = _allocStrided(K * L);
+        uint256 kl = p.k * p.l;
+        uint256 polys = _allocStrided(kl);
         uint256 ones = _allocStrided(1); // sample against z ≡ 1: acc = Â[i][j] itself
         assembly ("memory-safe") {
-            for { let p := ones } lt(p, add(ones, ACC_STRIDE)) { p := add(p, 0x20) } { mstore(p, 1) }
+            for { let x := ones } lt(x, add(ones, ACC_STRIDE)) { x := add(x, 0x20) } { mstore(x, 1) }
         }
-        sampleMatrix(ks, rho, ones, 0, polys, false);
-        for (uint256 m; m < K * L; ++m) {
+        sampleMatrix(ks, rho, ones, 0, polys, false, p.k, p.l);
+        for (uint256 m; m < kl; ++m) {
             _pack3(polys + m * ACC_STRIDE, out + m * 768);
         }
     }
 
-    /// @dev t̂ = NTT(t1·2^d) mod q, packed → T_HAT_BYTES at `out`.
-    function _writeTHat(bytes memory publicKey, uint256 out) private pure {
+    /// @dev t̂ = NTT(t1·2^d) mod q, packed → tHatBytes at `out`.
+    function _writeTHat(Params memory p, bytes memory publicKey, uint256 out) private pure {
         uint256 zp = _ptr(_zetas());
         uint256 t = _allocWords(256);
-        for (uint256 i; i < K; ++i) {
+        for (uint256 i; i < p.k; ++i) {
             decodeT1(publicKey, i, t);
             ntt(t, zp);
             _scale(t, 1 << D); // also reduces into [0, q)
@@ -194,41 +260,44 @@ library MLDSA65 {
     }
 
     /// @notice `verify` against a `precompute` blob instead of the public key.
-    /// @dev    TRUST: the blob is taken as `precompute(pk)` of the key the caller
-    ///         means. Verification checks the signature against tr, Â and t̂ ONLY —
-    ///         the key itself is not available here, so nothing ties the blob back to
-    ///         it. A blob built from Â/t̂ chosen by an attacker makes forgery easy;
-    ///         the blob must come from `precompute` over the registered key (see
-    ///         `MLDSA65KeyFactory`, which computes it on-chain from the key and keys
-    ///         both data contracts by keccak256(pk)). A blob of another (honest) key simply fails
-    ///         to verify. Returns false for a blob that is not BLOB_BYTES long.
-    function verifyPrecomputed(bytes memory blob, bytes memory message, bytes memory signature)
+    /// @dev    TRUST: the blob is taken as `precompute(set, pk)` of the key the
+    ///         caller means. Verification checks the signature against tr, Â and t̂
+    ///         ONLY — the key itself is not available here, so nothing ties the blob
+    ///         back to it. A blob built from Â/t̂ chosen by an attacker makes forgery
+    ///         easy; the blob must come from `precompute` over the registered key
+    ///         (see `MLDSAKeyFactory`, which computes it on-chain from the key and
+    ///         keys both data contracts by (set, keccak256(pk))). A blob of another
+    ///         (honest) key simply fails to verify. Returns false for a blob whose
+    ///         length is not that of `set`.
+    function verifyPrecomputed(ParamSet set, bytes memory blob, bytes memory message, bytes memory signature)
         internal
         view
         returns (bool)
     {
-        return verifyPrecomputedWithContext(blob, "", message, signature);
+        return verifyPrecomputedWithContext(set, blob, "", message, signature);
     }
 
     /// @notice `verifyPrecomputed` with a context string (Algorithm 3's M′).
     function verifyPrecomputedWithContext(
+        ParamSet set,
         bytes memory blob,
         bytes memory ctx,
         bytes memory message,
         bytes memory signature
     ) internal view returns (bool) {
         if (ctx.length > 255) return false;
-        return verifyPrecomputedInternal(blob, _formatMessage(ctx, message), signature);
+        return verifyPrecomputedInternal(set, blob, _formatMessage(ctx, message), signature);
     }
 
     /// @notice Algorithm 8 over a formatted M′, against a `precompute` blob.
-    function verifyPrecomputedInternal(bytes memory blob, bytes memory mPrime, bytes memory signature)
+    function verifyPrecomputedInternal(ParamSet set, bytes memory blob, bytes memory mPrime, bytes memory signature)
         internal
         view
         returns (bool)
     {
-        if (blob.length != BLOB_BYTES) return false;
-        return _verifyCore("", blob, mPrime, signature);
+        (bool ok, Params memory p) = params(set);
+        if (!ok || blob.length != TR_BYTES + p.aHatBytes + p.tHatBytes) return false;
+        return _verifyCore(p, "", blob, mPrime, signature);
     }
 
     /// @dev M′ = 0x00 ‖ |ctx| ‖ ctx ‖ M (caller checked |ctx| ≤ 255).
@@ -239,33 +308,40 @@ library MLDSA65 {
     /// @dev Algorithm 8. Exactly one of `publicKey` / `blob` is non-empty (length
     ///      already checked): with the key, tr is hashed, Â is streamed from ρ (fused
     ///      with Â∘ẑ) and t̂ is transformed here; with the blob, all three are read.
-    function _verifyCore(bytes memory publicKey, bytes memory blob, bytes memory mPrime, bytes memory signature)
-        private
-        pure
-        returns (bool)
-    {
-        if (signature.length != SIG_BYTES) return false;
+    function _verifyCore(
+        Params memory p,
+        bytes memory publicKey,
+        bytes memory blob,
+        bytes memory mPrime,
+        bytes memory signature
+    ) private pure returns (bool) {
+        if (signature.length != p.sigBytes) return false;
         bool pre = blob.length != 0;
+        uint256 k = p.k;
+        uint256 l = p.l;
 
         // Algorithm 21 (HintBitUnpack): cheap, and a malformed h is a rejection.
-        (bool hintOk, uint256[K] memory hints) = hintBitUnpack(signature);
+        (bool hintOk, uint256[MAX_K] memory hints) = hintBitUnpack(p, signature);
         if (!hintOk) return false;
 
         // z ← BitUnpack(...); reject unless ||z||∞ < γ1 − β (step 13 of Algorithm 8,
         // checked early — the result is a conjunction, so order is immaterial).
         // 8 words of slack after the last polynomial: the sampler may read past it.
-        uint256 zHat = _allocWords(L * 256 + 8);
-        if (!decodeZ(signature, zHat)) return false;
+        uint256 zHat = _allocWords(l * 256 + 8);
+        if (!decodeZ(p, signature, zHat)) return false;
 
         uint256 zp = _ptr(_zetas());
-        for (uint256 j; j < L; ++j) {
+        for (uint256 j; j < l; ++j) {
             ntt(zHat + j * 0x2000, zp);
         }
 
         uint256 ks = newKeccakWorkspace();
-
-        // tr ← H(pk, 64) (or from the blob);  μ ← H(BytesToBits(tr) ‖ M′, 64)
-        bytes memory w1Buf = new bytes(64 + K * W1_POLY_BYTES); // μ ‖ w1Encode(w1′)
+        // tr ← H(pk, 64) (or from the blob);  μ ← H(BytesToBits(tr) ‖ M′, 64), with
+        // SampleInBall's H(c̃) absorbed into slot 1 of the same final permutation.
+        // w1Buf = μ ‖ w1Encode(w1′), plus 32 bytes of slack: the 6-bit packer
+        // stores 3 bytes at a time with full-word writes.
+        uint256 w1Len = 64 + k * p.w1PolyBytes;
+        bytes memory w1Buf = new bytes(w1Len + 32);
         {
             bytes32 tr0;
             bytes32 tr1;
@@ -275,10 +351,10 @@ library MLDSA65 {
                     tr1 := mload(add(blob, 0x40))
                 }
             } else {
-                (tr0, tr1) = shake256To64(ks, _ptr(publicKey), PK_BYTES);
+                (tr0, tr1) = shake256To64(ks, _ptr(publicKey), p.pkBytes);
             }
             bytes memory trM = abi.encodePacked(tr0, tr1, mPrime);
-            (bytes32 mu0, bytes32 mu1) = shake256To64(ks, _ptr(trM), trM.length);
+            (bytes32 mu0, bytes32 mu1) = shake256MuAndBall(ks, _ptr(trM), trM.length, _ptr(signature), p.cTildeBytes);
             assembly ("memory-safe") {
                 mstore(add(w1Buf, 0x20), mu0)
                 mstore(add(w1Buf, 0x40), mu1)
@@ -288,68 +364,94 @@ library MLDSA65 {
         // c ← SampleInBall(c̃);  ĉ = NTT(c). On the key path ĉ′ = ĉ·2^d folds the
         // t1·2^d scaling into ĉ; the blob's t̂ already carries it.
         uint256 cHat = _allocWords(256);
-        sampleInBall(ks, _ptr(signature), cHat);
+        sampleInBall(ks, _ptr(signature), p.cTildeBytes, p.tau, cHat, 1);
         ntt(cHat, zp);
         if (!pre) _scale(cHat, 1 << D);
 
-        // acc_i = Σ_j Â[i][j]∘ẑ_j for all rows (unreduced, < 5·q·10q < 2^56).
-        uint256 accs = _allocStrided(K);
+        // acc_i = Σ_j Â[i][j]∘ẑ_j for all rows (unreduced, < ℓ·q·10q < 2^56).
+        uint256 accs = _allocStrided(k);
         if (pre) {
-            mulPackedA(_ptr(blob) + A_HAT_OFFSET, zHat, accs);
+            mulPackedA(_ptr(blob) + A_HAT_OFFSET, zHat, accs, k, l);
         } else {
             bytes32 rho;
             assembly ("memory-safe") {
                 rho := mload(add(publicKey, 0x20))
             }
-            sampleMatrix(ks, rho, zHat, 0x2000, accs, true);
+            sampleMatrix(ks, rho, zHat, 0x2000, accs, true, k, l);
         }
 
+        // acc_i = acc_i − ĉ∘t̂_i, reduced into [0, q).
         uint256 t1Hat = pre ? 0 : _allocWords(256);
-        for (uint256 i; i < K; ++i) {
+        for (uint256 i; i < k; ++i) {
             uint256 acc = accs + i * ACC_STRIDE;
-            // acc = acc − ĉ∘t̂_i, reduced into [0, q); then NTT⁻¹.
             if (pre) {
-                _subProductPacked(acc, cHat, _ptr(blob) + T_HAT_OFFSET + i * 768);
+                _subProductPacked(acc, cHat, _ptr(blob) + A_HAT_OFFSET + p.aHatBytes + i * 768);
             } else {
                 decodeT1(publicKey, i, t1Hat);
                 ntt(t1Hat, zp);
                 _subProduct(acc, cHat, t1Hat);
             }
-            invNtt(acc, zp);
-            // w1′_i = UseHint(h_i, w′_i), packed straight into the hash input.
-            useHintPack(acc, hints[i], _ptr(w1Buf) + 64 + i * W1_POLY_BYTES);
         }
+        _finishRows(p, accs, zp, hints, _ptr(w1Buf) + 64);
 
-        // c̃′ ← H(μ ‖ w1Encode(w1′), λ/4) and compare with c̃.
-        (bytes32 c0, bytes32 c1) = shake256To64(ks, _ptr(w1Buf), w1Buf.length);
+        // c̃′ ← H(μ ‖ w1Encode(w1′), λ/4) and compare with c̃ (32 or 48 bytes).
+        (bytes32 c0, bytes32 c1) = shake256To64(ks, _ptr(w1Buf), w1Len);
+        uint256 cLen = p.cTildeBytes;
         bool same;
         assembly ("memory-safe") {
             let s := add(signature, 0x20)
-            let hi := not(sub(shl(128, 1), 1)) // top 16 bytes: c̃ is 48 = 32 + 16 bytes
-            same := and(eq(c0, mload(s)), eq(and(c1, hi), and(mload(add(s, 0x20)), hi)))
+            same := eq(c0, mload(s))
+            if eq(cLen, 48) {
+                let hi := not(sub(shl(128, 1), 1)) // top 16 bytes: c̃ is 48 = 32 + 16 bytes
+                same := and(same, eq(and(c1, hi), and(mload(add(s, 0x20)), hi)))
+            }
         }
         return same;
+    }
+
+    /// @dev w′_i = NTT⁻¹(acc_i), then w1′_i = UseHint(h_i, w′_i) packed straight into
+    ///      the hash input at w1Out + i·w1PolyBytes. Its own function (rather than
+    ///      part of `_verifyCore`'s row loop) so the inlined NTT⁻¹ has stack room.
+    function _finishRows(Params memory p, uint256 accs, uint256 zp, uint256[MAX_K] memory hints, uint256 w1Out)
+        private
+        pure
+    {
+        bool is65 = p.is65;
+        uint256 w1PolyBytes = p.w1PolyBytes;
+        for (uint256 i; i < p.k; ++i) {
+            uint256 acc = accs + i * ACC_STRIDE;
+            invNtt(acc, zp);
+            useHintPack(is65, acc, hints[i], w1Out + i * w1PolyBytes);
+        }
     }
 
     // ── Decoding (FIPS 204 §7.2 / §7.1) ──────────────────────────────────────
 
     /// @notice HintBitUnpack (Algorithm 21) of σ's last ω + k bytes, as k bitmaps
-    ///         (bit n of hints[i] ⇔ h_i has a 1 at coefficient n).
+    ///         (bit n of hints[i] ⇔ h_i has a 1 at coefficient n; rows ≥ k stay 0).
+    ///         The caller has checked |σ| = sigBytes.
     /// @return ok false where Algorithm 21 returns ⊥:
     ///         - a row end y[ω+i] below the previous end, or above ω;
     ///         - indices within a row not STRICTLY increasing (a repeated index is
     ///           malformed even though it would decode to the same h — accepting it
     ///           would break strong unforgeability);
     ///         - a non-zero byte in the unused tail y[Index..ω).
-    function hintBitUnpack(bytes memory signature) internal pure returns (bool ok, uint256[K] memory hints) {
+    function hintBitUnpack(Params memory p, bytes memory signature)
+        internal
+        pure
+        returns (bool ok, uint256[MAX_K] memory hints)
+    {
+        uint256 k = p.k;
+        uint256 omega = p.omega;
+        uint256 yOff = p.cTildeBytes + p.l * p.zPolyBytes; // 32 + 4·576 / 48 + 5·640
         assembly ("memory-safe") {
-            // y = the 61-byte hint encoding, at σ offset 48 + 3200
-            let y := add(signature, add(0x20, 3248))
+            // y = the ω + k byte hint encoding (84 / 61 bytes)
+            let y := add(add(signature, 0x20), yOff)
             ok := 1
             let index := 0
-            for { let i := 0 } lt(i, 6) { i := add(i, 1) } {
-                let lim := byte(0, mload(add(y, add(55, i))))
-                if or(lt(lim, index), gt(lim, 55)) {
+            for { let i := 0 } lt(i, k) { i := add(i, 1) } {
+                let lim := byte(0, mload(add(y, add(omega, i))))
+                if or(lt(lim, index), gt(lim, omega)) {
                     ok := 0
                     break
                 }
@@ -369,7 +471,7 @@ library MLDSA65 {
                 mstore(add(hints, shl(5, i)), bits)
             }
             if ok {
-                for {} lt(index, 55) { index := add(index, 1) } {
+                for {} lt(index, omega) { index := add(index, 1) } {
                     if byte(0, mload(add(y, index))) {
                         ok := 0
                         break
@@ -379,13 +481,52 @@ library MLDSA65 {
         }
     }
 
-    /// @notice z ← BitUnpack(σ[48 .. 3248], γ1 − 1, γ1) into ℓ polynomials at `out`,
-    ///         as residues mod q (lazily: in [0, 2q)).
+    /// @notice z ← BitUnpack(σ[|c̃| ..], γ1 − 1, γ1) into ℓ polynomials at `out`,
+    ///         as residues mod q (lazily: in [0, 2q)). The caller has checked |σ|.
     /// @return ok ||z||∞ < γ1 − β.
-    /// @dev    Each coefficient is z = γ1 − r with r a 20-bit little-endian field
-    ///         (two per 5 bytes). |z| < γ1 − β ⇔ β < r < 2γ1 − β; the residue is
+    /// @dev    Each coefficient is z = γ1 − r with r an unsigned little-endian bit
+    ///         field. |z| < γ1 − β ⇔ β < r < 2γ1 − β; the residue is
     ///         q + γ1 − r ∈ (q − γ1, q + γ1), which the NTT accepts as is.
-    function decodeZ(bytes memory signature, uint256 out) internal pure returns (bool ok) {
+    function decodeZ(Params memory p, bytes memory signature, uint256 out) internal pure returns (bool) {
+        return p.is65 ? _decodeZ65(signature, out) : _decodeZ44(signature, out);
+    }
+
+    /// @dev ML-DSA-44: z at σ[32 .. 2336), 18-bit fields, four per 9 bytes;
+    ///      γ1 = 2^17, β = 78.
+    function _decodeZ44(bytes memory signature, uint256 out) private pure returns (bool ok) {
+        assembly ("memory-safe") {
+            let src := add(signature, add(0x20, 32))
+            let end := add(out, mul(0x2000, 4))
+            ok := 1
+            for {} lt(out, end) { out := add(out, 0x80) } {
+                let w := mload(src)
+                let b2 := byte(2, w)
+                let b4 := byte(4, w)
+                let b6 := byte(6, w)
+                let r0 := or(or(byte(0, w), shl(8, byte(1, w))), shl(16, and(b2, 0x03)))
+                let r1 := or(or(shr(2, b2), shl(6, byte(3, w))), shl(14, and(b4, 0x0f)))
+                let r2 := or(or(shr(4, b4), shl(4, byte(5, w))), shl(12, and(b6, 0x3f)))
+                let r3 := or(or(shr(6, b6), shl(2, byte(7, w))), shl(10, byte(8, w)))
+                // β < r < 2γ1 − β  (2γ1 − β = 262066)
+                ok := and(
+                    ok,
+                    and(
+                        and(and(gt(r0, 78), lt(r0, 262066)), and(gt(r1, 78), lt(r1, 262066))),
+                        and(and(gt(r2, 78), lt(r2, 262066)), and(gt(r3, 78), lt(r3, 262066)))
+                    )
+                )
+                mstore(out, sub(8511489, r0)) //          q + γ1 = 8511489
+                mstore(add(out, 0x20), sub(8511489, r1))
+                mstore(add(out, 0x40), sub(8511489, r2))
+                mstore(add(out, 0x60), sub(8511489, r3))
+                src := add(src, 9)
+            }
+        }
+    }
+
+    /// @dev ML-DSA-65: z at σ[48 .. 3248), 20-bit fields, two per 5 bytes;
+    ///      γ1 = 2^19, β = 196.
+    function _decodeZ65(bytes memory signature, uint256 out) private pure returns (bool ok) {
         assembly ("memory-safe") {
             let src := add(signature, add(0x20, 48))
             let end := add(out, mul(0x2000, 5))
@@ -426,19 +567,28 @@ library MLDSA65 {
 
     // ── Sampling (FIPS 204 §7.3) ─────────────────────────────────────────────
 
-    /// @notice SampleInBall (Algorithm 29): c with τ = 49 coefficients ±1, written
-    ///         as residues (1 or q − 1) into the zeroed polynomial at `c`.
-    /// @dev    Absorbs ALL 48 bytes of c̃ (final FIPS 204; the draft used 32). The
-    ///         first 8 squeezed bytes are the sign bits — exactly Keccak lane 0,
-    ///         little-endian — then one byte per draw, rejecting j > i.
-    function sampleInBall(uint256 ks, uint256 sigData, uint256 c) internal pure {
-        absorb(ks, sigData, C_TILDE_BYTES, RATE256);
+    /// @notice SampleInBall (Algorithm 29): c with τ coefficients ±1 (39 / 49),
+    ///         written as residues (1 or q − 1) into the zeroed polynomial at `c`.
+    /// @dev    Absorbs ALL λ/4 bytes of c̃ (32 / 48; final FIPS 204 — the draft
+    ///         used 32 for every set). The first 8 squeezed bytes are the sign bits
+    ///         (τ ≤ 64) — exactly Keccak lane 0, little-endian — then one byte per
+    ///         draw, rejecting j > i.
+    ///         slot = 0: absorbs c̃ here (into slot 0). slot = 1: c̃ was already
+    ///         absorbed into slot 1 by `shake256MuAndBall`, whose final permutation
+    ///         produced the first output block there. Further blocks, if needed,
+    ///         come from the 4-way permutation, which advances every slot.
+    function sampleInBall(uint256 ks, uint256 sigData, uint256 cTildeBytes, uint256 tau, uint256 c, uint256 slot)
+        internal
+        pure
+    {
+        if (slot == 0) absorb(ks, sigData, cTildeBytes, RATE256);
+        uint256 sh = slot << 6;
         uint256 signs;
         assembly ("memory-safe") {
-            signs := and(mload(ks), 0xffffffffffffffff) // lane 0, slot 0
+            signs := and(shr(sh, mload(ks)), 0xffffffffffffffff) // lane 0 of the slot
         }
         uint256 pos = 8;
-        for (uint256 i = 256 - TAU; i < 256; ++i) {
+        for (uint256 i = 256 - tau; i < 256; ++i) {
             uint256 j;
             while (true) {
                 if (pos == RATE256) {
@@ -446,7 +596,7 @@ library MLDSA65 {
                     pos = 0;
                 }
                 assembly ("memory-safe") {
-                    j := and(shr(shl(3, and(pos, 7)), mload(add(ks, shl(5, shr(3, pos))))), 0xff)
+                    j := and(shr(add(sh, shl(3, and(pos, 7))), mload(add(ks, shl(5, shr(3, pos))))), 0xff)
                 }
                 ++pos;
                 if (j <= i) break;
@@ -462,12 +612,12 @@ library MLDSA65 {
         }
     }
 
-    /// @notice The 30 RejNTTPoly streams of ExpandA (Algorithms 30 & 32),
+    /// @notice The k·ℓ RejNTTPoly streams of ExpandA (Algorithms 30 & 32; 16 / 30),
     ///         Â[i][j] = RejNTTPoly(ρ ‖ IntegerToBytes(j,1) ‖ IntegerToBytes(i,1)),
     ///         run four at a time on the 4-way permutation. Each accepted
     ///         coefficient a of Â[i][j] at position n does
     ///             acc[n] += a · z_j[n],  z_j = zBase + j·zStride,
-    ///         where acc is row i's accumulator (`perRow`) or stream 5i + j's own
+    ///         where acc is row i's accumulator (`perRow`) or stream ℓi + j's own
     ///         polynomial (`!perRow`, used by `precompute` with z ≡ 1, zStride = 0).
     ///         Accumulators (stride ACC_STRIDE) must start zeroed.
     /// @dev    A SHAKE128 block is 168 bytes = 56 candidates of 3 bytes, and every 3
@@ -476,31 +626,41 @@ library MLDSA65 {
     ///         (the mask is the "b2 mod 128" of Algorithm 14). 256 is checked once
     ///         per group, so up to 7 surplus candidates land in the 8 slack words
     ///         after each accumulator (and read slack after z) — never used.
-    function sampleMatrix(uint256 ks, bytes32 rho, uint256 zBase, uint256 zStride, uint256 accBase, bool perRow)
-        internal
-        pure
-    {
-        for (uint256 b; b < 8; ++b) {
-            // n_s (byte offset of the next coefficient) of the four slots, packed
-            // 16 bits each; an unused slot (stream ≥ 30) starts finished.
-            uint256 ns;
-            for (uint256 s; s < 4; ++s) {
-                if (4 * b + s >= K * L) ns |= 0x2000 << (16 * s);
-            }
-            _initBatch(ks, rho, b);
-            while (true) {
-                keccakF(ks);
-                bool allDone = true;
+    function sampleMatrix(
+        uint256 ks,
+        bytes32 rho,
+        uint256 zBase,
+        uint256 zStride,
+        uint256 accBase,
+        bool perRow,
+        uint256 k,
+        uint256 l
+    ) internal pure {
+        // Small bounded integers only (k·ℓ ≤ 30 streams, offsets < 2^14).
+        unchecked {
+            uint256 streams = k * l;
+            for (uint256 b; 4 * b < streams; ++b) {
+                // n_s (byte offset of the next coefficient) of the four slots, packed
+                // 16 bits each; an unused slot (stream ≥ k·ℓ) starts finished.
+                uint256 ns;
                 for (uint256 s; s < 4; ++s) {
-                    uint256 n = (ns >> (16 * s)) & 0xffff;
-                    if (n >= 0x2000) continue;
-                    uint256 m = 4 * b + s; // stream index 5i + j
-                    uint256 acc = accBase + (perRow ? m / L : m) * ACC_STRIDE;
-                    n = _drainSlot(ks, s, n, zBase + (m % L) * zStride, acc);
-                    ns = (ns & ~(0xffff << (16 * s))) | (n << (16 * s));
-                    if (n < 0x2000) allDone = false;
+                    if (4 * b + s >= streams) ns |= 0x2000 << (16 * s);
                 }
-                if (allDone) break;
+                _initBatch(ks, rho, b, l);
+                while (true) {
+                    keccakF(ks);
+                    bool allDone = true;
+                    for (uint256 s; s < 4; ++s) {
+                        uint256 n = (ns >> (16 * s)) & 0xffff;
+                        if (n >= 0x2000) continue;
+                        uint256 m = 4 * b + s; // stream index ℓi + j
+                        uint256 acc = accBase + (perRow ? m / l : m) * ACC_STRIDE;
+                        n = _drainSlot(ks, s, n, zBase + (m % l) * zStride, acc);
+                        ns = (ns & ~(0xffff << (16 * s))) | (n << (16 * s));
+                        if (n < 0x2000) allDone = false;
+                    }
+                    if (allDone) break;
+                }
             }
         }
     }
@@ -509,8 +669,9 @@ library MLDSA65 {
     ///      The 34-byte input fits one SHAKE128 block, so the padded block is written
     ///      directly: lanes 0..3 = ρ, lane 4 = j | i << 8 | 0x1F << 16 (SHAKE domain
     ///      bits + first pad bit at byte 34), lane 20 = 0x80 << 56 (last pad bit,
-    ///      byte 167). The caller then runs the permutation.
-    function _initBatch(uint256 ks, bytes32 rho, uint256 b) private pure {
+    ///      byte 167). Stream m is (i, j) = (m div ℓ, m mod ℓ). The caller then
+    ///      runs the permutation.
+    function _initBatch(uint256 ks, bytes32 rho, uint256 b, uint256 l) private pure {
         assembly ("memory-safe") {
             for { let o := 0 } lt(o, 0x320) { o := add(o, 0x20) } { mstore(add(ks, o), 0) }
             let w := _bswap64x4(rho)
@@ -522,7 +683,7 @@ library MLDSA65 {
             let l4 := 0
             for { let s := 0 } lt(s, 4) { s := add(s, 1) } {
                 let m := add(shl(2, b), s)
-                l4 := or(l4, shl(shl(6, s), or(or(mod(m, 5), shl(8, div(m, 5))), 0x1f0000)))
+                l4 := or(l4, shl(shl(6, s), or(or(mod(m, l), shl(8, div(m, l))), 0x1f0000)))
             }
             mstore(add(ks, 0x80), l4)
             mstore(add(ks, 0x280), mul(0x8000000000000000, p))
@@ -546,78 +707,141 @@ library MLDSA65 {
 
     /// @dev Consumes slot s's current 168-byte block: rejection-samples its 56
     ///      candidates into acc[n..] += v·z[n..]. n is a byte offset; returns it.
+    ///      Per group of 8 candidates, one SWAR test decides whether all 8 are
+    ///      accepted: v ≥ q = 0x7FE001 needs v ≥ 0x7FE000, i.e. bits 13..22 all set,
+    ///      and adding 2^13 to exactly those bits carries into bit 23 of the field
+    ///      iff they are (no carry crosses a 24-bit field). Such groups (all but
+    ///      ~0.8%) take a branch-free path; the others go candidate by candidate.
     function _drainSlot(uint256 ks, uint256 s, uint256 n, uint256 z, uint256 acc) private pure returns (uint256) {
         assembly ("memory-safe") {
-            let sh := shl(6, s)
-            let m := 0xffffffffffffffff
+            let pa := add(acc, n) // next accumulator word
+            let pz := add(z, n) //   matching z word
             for { let g := ks } lt(g, add(ks, 0x2a0)) { g := add(g, 0x60) } {
-                if iszero(lt(n, 0x2000)) { break }
-                // lanes g, g+1, g+2 of this slot as one 192-bit little-endian integer
-                let x := or(
-                    or(and(shr(sh, mload(g)), m), shl(64, and(shr(sh, mload(add(g, 0x20))), m))),
-                    shl(128, and(shr(sh, mload(add(g, 0x40))), m))
+                if iszero(lt(pa, add(acc, 0x2000))) { break }
+                // lanes g, g+1, g+2 of this slot as one 192-bit little-endian integer,
+                // staged in scratch memory and re-read per candidate: held on the
+                // stack, the optimizer re-derives it from the three lanes for every
+                // candidate (measured: ~1.35x the per-candidate cost).
+                let sh := shl(6, s)
+                mstore(
+                    0,
+                    or(
+                        or(
+                            and(shr(sh, mload(g)), 0xffffffffffffffff),
+                            shl(64, and(shr(sh, mload(add(g, 0x20))), 0xffffffffffffffff))
+                        ),
+                        shl(128, and(shr(sh, mload(add(g, 0x40))), 0xffffffffffffffff))
+                    )
                 )
-                let v := and(x, 0x7fffff)
-                if lt(v, Q) {
-                    let pa := add(acc, n)
-                    mstore(pa, add(mload(pa), mul(v, mload(add(z, n)))))
-                    n := add(n, 0x20)
+                switch and(
+                    add(
+                        and(mload(0), 0x7fe0007fe0007fe0007fe0007fe0007fe0007fe0007fe000),
+                        0x2000002000002000002000002000002000002000002000
+                    ),
+                    0x800000800000800000800000800000800000800000800000
+                )
+                case 0 {
+                    // all 8 candidates < q
+                    {
+                        let p := pa
+                        mstore(p, add(mload(p), mul(and(mload(0), 0x7fffff), mload(pz))))
+                    }
+                    {
+                        let p := add(pa, 0x20)
+                        mstore(p, add(mload(p), mul(and(shr(24, mload(0)), 0x7fffff), mload(add(pz, 0x20)))))
+                    }
+                    {
+                        let p := add(pa, 0x40)
+                        mstore(p, add(mload(p), mul(and(shr(48, mload(0)), 0x7fffff), mload(add(pz, 0x40)))))
+                    }
+                    {
+                        let p := add(pa, 0x60)
+                        mstore(p, add(mload(p), mul(and(shr(72, mload(0)), 0x7fffff), mload(add(pz, 0x60)))))
+                    }
+                    {
+                        let p := add(pa, 0x80)
+                        mstore(p, add(mload(p), mul(and(shr(96, mload(0)), 0x7fffff), mload(add(pz, 0x80)))))
+                    }
+                    {
+                        let p := add(pa, 0xa0)
+                        mstore(p, add(mload(p), mul(and(shr(120, mload(0)), 0x7fffff), mload(add(pz, 0xa0)))))
+                    }
+                    {
+                        let p := add(pa, 0xc0)
+                        mstore(p, add(mload(p), mul(and(shr(144, mload(0)), 0x7fffff), mload(add(pz, 0xc0)))))
+                    }
+                    {
+                        let p := add(pa, 0xe0)
+                        mstore(p, add(mload(p), mul(and(shr(168, mload(0)), 0x7fffff), mload(add(pz, 0xe0)))))
+                    }
+                    pa := add(pa, 0x100)
+                    pz := add(pz, 0x100)
                 }
-                v := and(shr(24, x), 0x7fffff)
-                if lt(v, Q) {
-                    let pa := add(acc, n)
-                    mstore(pa, add(mload(pa), mul(v, mload(add(z, n)))))
-                    n := add(n, 0x20)
-                }
-                v := and(shr(48, x), 0x7fffff)
-                if lt(v, Q) {
-                    let pa := add(acc, n)
-                    mstore(pa, add(mload(pa), mul(v, mload(add(z, n)))))
-                    n := add(n, 0x20)
-                }
-                v := and(shr(72, x), 0x7fffff)
-                if lt(v, Q) {
-                    let pa := add(acc, n)
-                    mstore(pa, add(mload(pa), mul(v, mload(add(z, n)))))
-                    n := add(n, 0x20)
-                }
-                v := and(shr(96, x), 0x7fffff)
-                if lt(v, Q) {
-                    let pa := add(acc, n)
-                    mstore(pa, add(mload(pa), mul(v, mload(add(z, n)))))
-                    n := add(n, 0x20)
-                }
-                v := and(shr(120, x), 0x7fffff)
-                if lt(v, Q) {
-                    let pa := add(acc, n)
-                    mstore(pa, add(mload(pa), mul(v, mload(add(z, n)))))
-                    n := add(n, 0x20)
-                }
-                v := and(shr(144, x), 0x7fffff)
-                if lt(v, Q) {
-                    let pa := add(acc, n)
-                    mstore(pa, add(mload(pa), mul(v, mload(add(z, n)))))
-                    n := add(n, 0x20)
-                }
-                v := and(shr(168, x), 0x7fffff)
-                if lt(v, Q) {
-                    let pa := add(acc, n)
-                    mstore(pa, add(mload(pa), mul(v, mload(add(z, n)))))
-                    n := add(n, 0x20)
+                default {
+                    let v := 0
+                    v := and(mload(0), 0x7fffff)
+                    if lt(v, Q) {
+                        mstore(pa, add(mload(pa), mul(v, mload(pz))))
+                        pa := add(pa, 0x20)
+                        pz := add(pz, 0x20)
+                    }
+                    v := and(shr(24, mload(0)), 0x7fffff)
+                    if lt(v, Q) {
+                        mstore(pa, add(mload(pa), mul(v, mload(pz))))
+                        pa := add(pa, 0x20)
+                        pz := add(pz, 0x20)
+                    }
+                    v := and(shr(48, mload(0)), 0x7fffff)
+                    if lt(v, Q) {
+                        mstore(pa, add(mload(pa), mul(v, mload(pz))))
+                        pa := add(pa, 0x20)
+                        pz := add(pz, 0x20)
+                    }
+                    v := and(shr(72, mload(0)), 0x7fffff)
+                    if lt(v, Q) {
+                        mstore(pa, add(mload(pa), mul(v, mload(pz))))
+                        pa := add(pa, 0x20)
+                        pz := add(pz, 0x20)
+                    }
+                    v := and(shr(96, mload(0)), 0x7fffff)
+                    if lt(v, Q) {
+                        mstore(pa, add(mload(pa), mul(v, mload(pz))))
+                        pa := add(pa, 0x20)
+                        pz := add(pz, 0x20)
+                    }
+                    v := and(shr(120, mload(0)), 0x7fffff)
+                    if lt(v, Q) {
+                        mstore(pa, add(mload(pa), mul(v, mload(pz))))
+                        pa := add(pa, 0x20)
+                        pz := add(pz, 0x20)
+                    }
+                    v := and(shr(144, mload(0)), 0x7fffff)
+                    if lt(v, Q) {
+                        mstore(pa, add(mload(pa), mul(v, mload(pz))))
+                        pa := add(pa, 0x20)
+                        pz := add(pz, 0x20)
+                    }
+                    v := and(shr(168, mload(0)), 0x7fffff)
+                    if lt(v, Q) {
+                        mstore(pa, add(mload(pa), mul(v, mload(pz))))
+                        pa := add(pa, 0x20)
+                        pz := add(pz, 0x20)
+                    }
                 }
             }
+            n := sub(pa, acc)
         }
         return n;
     }
 
     /// @notice acc_i[n] = Σ_j Â[i][j][n]·ẑ_j[n] from a packed Â at `src` (layout
-    ///         as in BLOB_BYTES); accumulators at stride ACC_STRIDE, unreduced like
-    ///         the streamed path.
-    function mulPackedA(uint256 src, uint256 zHat, uint256 accs) internal pure {
+    ///         as in `precompute`, k·ℓ polynomials); accumulators at stride
+    ///         ACC_STRIDE, unreduced like the streamed path.
+    function mulPackedA(uint256 src, uint256 zHat, uint256 accs, uint256 k, uint256 l) internal pure {
         assembly ("memory-safe") {
-            for { let i := 0 } lt(i, 6) { i := add(i, 1) } {
+            for { let i := 0 } lt(i, k) { i := add(i, 1) } {
                 let acc := add(accs, mul(i, ACC_STRIDE))
-                for { let j := 0 } lt(j, 5) { j := add(j, 1) } {
+                for { let j := 0 } lt(j, l) { j := add(j, 1) } {
                     let z := add(zHat, shl(13, j))
                     for { let n := 0 } lt(n, 0x2000) { n := add(n, 0x20) } {
                         let pa := add(acc, n)
@@ -798,13 +1022,51 @@ library MLDSA65 {
     }
 
     /// @notice w1′_i = UseHint(h_i, w′_i) (Algorithm 40, via Decompose — Algorithm
-    ///         36) for one row, packed with w1Encode/SimpleBitPack (4 bits per
-    ///         coefficient, low nibble first) into 128 bytes at `out`.
-    /// @dev    For r ∈ [0, q): r0′ = r mod 2γ2, r1 = ⌊r / 2γ2⌋ (+1 if r0′ > γ2, i.e.
-    ///         r0 = r0′ − 2γ2 < 0). The corner r − r0 = q − 1 yields r1 = 16, which
-    ///         the spec maps to r1 = 0 with r0 − 1 ≤ 0 — the `& 15` and the
-    ///         "r0 > 0 ⇔ 1 ≤ r0′ ≤ γ2" test give exactly that. With hint: r1 ± 1 mod 16.
-    function useHintPack(uint256 w, uint256 hintBits, uint256 out) internal pure {
+    ///         36) for one row (coefficients in [0, q) at `w`), packed with
+    ///         w1Encode/SimpleBitPack into w1PolyBytes at `out`.
+    /// @dev    With m = (q − 1)/(2γ2) (44 / 16), for r ∈ [0, q): r0′ = r mod 2γ2,
+    ///         r1 = ⌊r / 2γ2⌋ (+1 if r0′ > γ2, i.e. r0 = r0′ − 2γ2 < 0). The corner
+    ///         r − r0 = q − 1 (only when r0 ≤ 0) yields r1 = m, which Decompose maps
+    ///         to r1 = 0 with r0 − 1 < 0 — reducing r1 mod m and testing
+    ///         "r0 > 0 ⇔ 1 ≤ r0′ ≤ γ2" on the unadjusted r0 give exactly that. With
+    ///         hint: r1 + 1 mod m if r0 > 0, else r1 − 1 mod m.
+    function useHintPack(bool is65, uint256 w, uint256 hintBits, uint256 out) internal pure {
+        if (is65) _useHintPack65(w, hintBits, out);
+        else _useHintPack44(w, hintBits, out);
+    }
+
+    /// @dev ML-DSA-44: 2γ2 = 190464, m = 44, w1 ∈ [0, 43] packed 6 bits per
+    ///      coefficient — four per 3 bytes, little-endian (w0 | w1 << 6 | w2 << 12 |
+    ///      w3 << 18) — into 192 bytes. Each group is a full-word store, so it writes
+    ///      29 bytes of junk past its 3; the next group (or the caller's 32 bytes of
+    ///      slack after the last row) overwrites them.
+    function _useHintPack44(uint256 w, uint256 hintBits, uint256 out) private pure {
+        assembly ("memory-safe") {
+            for { let n := 0 } lt(n, 256) { n := add(n, 4) } {
+                let v := 0
+                for { let t := 0 } lt(t, 4) { t := add(t, 1) } {
+                    let c := add(n, t)
+                    let r := mload(add(w, shl(5, c)))
+                    let r0 := mod(r, 190464) // 2γ2
+                    let r1 := add(div(r, 190464), gt(r0, 95232))
+                    if and(shr(c, hintBits), 1) {
+                        // r0 > 0 → r1 + 1, else r1 − 1 (mod 44)
+                        switch and(iszero(iszero(r0)), iszero(gt(r0, 95232)))
+                        case 0 { r1 := add(r1, 43) }
+                        default { r1 := add(r1, 1) }
+                    }
+                    v := or(v, shl(mul(6, t), mod(r1, 44)))
+                }
+                // the 24-bit group's bytes in stream order: v[0:8], v[8:16], v[16:24]
+                mstore(out, shl(232, or(or(shl(16, and(v, 0xff)), and(v, 0xff00)), shr(16, v))))
+                out := add(out, 3)
+            }
+        }
+    }
+
+    /// @dev ML-DSA-65: 2γ2 = 523776, m = 16 (so mod m is `& 15`), w1 ∈ [0, 15]
+    ///      packed 4 bits per coefficient, low nibble first, into 128 bytes.
+    function _useHintPack65(uint256 w, uint256 hintBits, uint256 out) private pure {
         assembly ("memory-safe") {
             for { let n := 0 } lt(n, 256) {} {
                 let word := 0
@@ -875,86 +1137,235 @@ library MLDSA65 {
         assembly ("memory-safe") {
             function round(a, o, dp) {
                 // θ: column parities C[x]; D[x] = C[x−1] ⊕ rot(C[x+1], 1), staged in memory
-                let c0 := xor(xor(xor(xor(mload(a), mload(add(a, 0xa0))), mload(add(a, 0x140))), mload(add(a, 0x1e0))), mload(add(a, 0x280)))
-                let c1 := xor(xor(xor(xor(mload(add(a, 0x20)), mload(add(a, 0xc0))), mload(add(a, 0x160))), mload(add(a, 0x200))), mload(add(a, 0x2a0)))
-                let c2 := xor(xor(xor(xor(mload(add(a, 0x40)), mload(add(a, 0xe0))), mload(add(a, 0x180))), mload(add(a, 0x220))), mload(add(a, 0x2c0)))
-                let c3 := xor(xor(xor(xor(mload(add(a, 0x60)), mload(add(a, 0x100))), mload(add(a, 0x1a0))), mload(add(a, 0x240))), mload(add(a, 0x2e0)))
-                let c4 := xor(xor(xor(xor(mload(add(a, 0x80)), mload(add(a, 0x120))), mload(add(a, 0x1c0))), mload(add(a, 0x260))), mload(add(a, 0x300)))
-                mstore(dp, xor(c4, or(and(shl(1, c1), 0xfffffffffffffffefffffffffffffffefffffffffffffffefffffffffffffffe), and(shr(63, c1), 0x0000000000000001000000000000000100000000000000010000000000000001))))
-                mstore(add(dp, 0x20), xor(c0, or(and(shl(1, c2), 0xfffffffffffffffefffffffffffffffefffffffffffffffefffffffffffffffe), and(shr(63, c2), 0x0000000000000001000000000000000100000000000000010000000000000001))))
-                mstore(add(dp, 0x40), xor(c1, or(and(shl(1, c3), 0xfffffffffffffffefffffffffffffffefffffffffffffffefffffffffffffffe), and(shr(63, c3), 0x0000000000000001000000000000000100000000000000010000000000000001))))
-                mstore(add(dp, 0x60), xor(c2, or(and(shl(1, c4), 0xfffffffffffffffefffffffffffffffefffffffffffffffefffffffffffffffe), and(shr(63, c4), 0x0000000000000001000000000000000100000000000000010000000000000001))))
-                mstore(add(dp, 0x80), xor(c3, or(and(shl(1, c0), 0xfffffffffffffffefffffffffffffffefffffffffffffffefffffffffffffffe), and(shr(63, c0), 0x0000000000000001000000000000000100000000000000010000000000000001))))
+                let c0 :=
+                    xor(
+                        xor(xor(xor(mload(a), mload(add(a, 0xa0))), mload(add(a, 0x140))), mload(add(a, 0x1e0))),
+                        mload(add(a, 0x280))
+                    )
+                let c1 :=
+                    xor(
+                        xor(
+                            xor(xor(mload(add(a, 0x20)), mload(add(a, 0xc0))), mload(add(a, 0x160))),
+                            mload(add(a, 0x200))
+                        ),
+                        mload(add(a, 0x2a0))
+                    )
+                let c2 :=
+                    xor(
+                        xor(
+                            xor(xor(mload(add(a, 0x40)), mload(add(a, 0xe0))), mload(add(a, 0x180))),
+                            mload(add(a, 0x220))
+                        ),
+                        mload(add(a, 0x2c0))
+                    )
+                let c3 :=
+                    xor(
+                        xor(
+                            xor(xor(mload(add(a, 0x60)), mload(add(a, 0x100))), mload(add(a, 0x1a0))),
+                            mload(add(a, 0x240))
+                        ),
+                        mload(add(a, 0x2e0))
+                    )
+                let c4 :=
+                    xor(
+                        xor(
+                            xor(xor(mload(add(a, 0x80)), mload(add(a, 0x120))), mload(add(a, 0x1c0))),
+                            mload(add(a, 0x260))
+                        ),
+                        mload(add(a, 0x300))
+                    )
+                mstore(
+                    dp,
+                    xor(
+                        c4,
+                        or(
+                            and(shl(1, c1), 0xfffffffffffffffefffffffffffffffefffffffffffffffefffffffffffffffe),
+                            and(shr(63, c1), 0x0000000000000001000000000000000100000000000000010000000000000001)
+                        )
+                    )
+                )
+                mstore(
+                    add(dp, 0x20),
+                    xor(
+                        c0,
+                        or(
+                            and(shl(1, c2), 0xfffffffffffffffefffffffffffffffefffffffffffffffefffffffffffffffe),
+                            and(shr(63, c2), 0x0000000000000001000000000000000100000000000000010000000000000001)
+                        )
+                    )
+                )
+                mstore(
+                    add(dp, 0x40),
+                    xor(
+                        c1,
+                        or(
+                            and(shl(1, c3), 0xfffffffffffffffefffffffffffffffefffffffffffffffefffffffffffffffe),
+                            and(shr(63, c3), 0x0000000000000001000000000000000100000000000000010000000000000001)
+                        )
+                    )
+                )
+                mstore(
+                    add(dp, 0x60),
+                    xor(
+                        c2,
+                        or(
+                            and(shl(1, c4), 0xfffffffffffffffefffffffffffffffefffffffffffffffefffffffffffffffe),
+                            and(shr(63, c4), 0x0000000000000001000000000000000100000000000000010000000000000001)
+                        )
+                    )
+                )
+                mstore(
+                    add(dp, 0x80),
+                    xor(
+                        c3,
+                        or(
+                            and(shl(1, c0), 0xfffffffffffffffefffffffffffffffefffffffffffffffefffffffffffffffe),
+                            and(shr(63, c0), 0x0000000000000001000000000000000100000000000000010000000000000001)
+                        )
+                    )
+                )
                 // ρ + π + χ, one output plane at a time: B[y][2x+3y] = rot(A[x][y] ⊕ D[x], r[x][y])
                 let b0 := xor(mload(a), mload(dp))
                 let b1 := xor(mload(add(a, 0xc0)), mload(add(dp, 0x20)))
-                b1 := or(and(shl(44, b1), 0xfffff00000000000fffff00000000000fffff00000000000fffff00000000000), and(shr(20, b1), 0x00000fffffffffff00000fffffffffff00000fffffffffff00000fffffffffff))
+                b1 := or(
+                    and(shl(44, b1), 0xfffff00000000000fffff00000000000fffff00000000000fffff00000000000),
+                    and(shr(20, b1), 0x00000fffffffffff00000fffffffffff00000fffffffffff00000fffffffffff)
+                )
                 let b2 := xor(mload(add(a, 0x180)), mload(add(dp, 0x40)))
-                b2 := or(and(shl(43, b2), 0xfffff80000000000fffff80000000000fffff80000000000fffff80000000000), and(shr(21, b2), 0x000007ffffffffff000007ffffffffff000007ffffffffff000007ffffffffff))
+                b2 := or(
+                    and(shl(43, b2), 0xfffff80000000000fffff80000000000fffff80000000000fffff80000000000),
+                    and(shr(21, b2), 0x000007ffffffffff000007ffffffffff000007ffffffffff000007ffffffffff)
+                )
                 let b3 := xor(mload(add(a, 0x240)), mload(add(dp, 0x60)))
-                b3 := or(and(shl(21, b3), 0xffffffffffe00000ffffffffffe00000ffffffffffe00000ffffffffffe00000), and(shr(43, b3), 0x00000000001fffff00000000001fffff00000000001fffff00000000001fffff))
+                b3 := or(
+                    and(shl(21, b3), 0xffffffffffe00000ffffffffffe00000ffffffffffe00000ffffffffffe00000),
+                    and(shr(43, b3), 0x00000000001fffff00000000001fffff00000000001fffff00000000001fffff)
+                )
                 let b4 := xor(mload(add(a, 0x300)), mload(add(dp, 0x80)))
-                b4 := or(and(shl(14, b4), 0xffffffffffffc000ffffffffffffc000ffffffffffffc000ffffffffffffc000), and(shr(50, b4), 0x0000000000003fff0000000000003fff0000000000003fff0000000000003fff))
+                b4 := or(
+                    and(shl(14, b4), 0xffffffffffffc000ffffffffffffc000ffffffffffffc000ffffffffffffc000),
+                    and(shr(50, b4), 0x0000000000003fff0000000000003fff0000000000003fff0000000000003fff)
+                )
                 mstore(o, xor(b0, and(not(b1), b2)))
                 mstore(add(o, 0x20), xor(b1, and(not(b2), b3)))
                 mstore(add(o, 0x40), xor(b2, and(not(b3), b4)))
                 mstore(add(o, 0x60), xor(b3, and(not(b4), b0)))
                 mstore(add(o, 0x80), xor(b4, and(not(b0), b1)))
                 b0 := xor(mload(add(a, 0x60)), mload(add(dp, 0x60)))
-                b0 := or(and(shl(28, b0), 0xfffffffff0000000fffffffff0000000fffffffff0000000fffffffff0000000), and(shr(36, b0), 0x000000000fffffff000000000fffffff000000000fffffff000000000fffffff))
+                b0 := or(
+                    and(shl(28, b0), 0xfffffffff0000000fffffffff0000000fffffffff0000000fffffffff0000000),
+                    and(shr(36, b0), 0x000000000fffffff000000000fffffff000000000fffffff000000000fffffff)
+                )
                 b1 := xor(mload(add(a, 0x120)), mload(add(dp, 0x80)))
-                b1 := or(and(shl(20, b1), 0xfffffffffff00000fffffffffff00000fffffffffff00000fffffffffff00000), and(shr(44, b1), 0x00000000000fffff00000000000fffff00000000000fffff00000000000fffff))
+                b1 := or(
+                    and(shl(20, b1), 0xfffffffffff00000fffffffffff00000fffffffffff00000fffffffffff00000),
+                    and(shr(44, b1), 0x00000000000fffff00000000000fffff00000000000fffff00000000000fffff)
+                )
                 b2 := xor(mload(add(a, 0x140)), mload(dp))
-                b2 := or(and(shl(3, b2), 0xfffffffffffffff8fffffffffffffff8fffffffffffffff8fffffffffffffff8), and(shr(61, b2), 0x0000000000000007000000000000000700000000000000070000000000000007))
+                b2 := or(
+                    and(shl(3, b2), 0xfffffffffffffff8fffffffffffffff8fffffffffffffff8fffffffffffffff8),
+                    and(shr(61, b2), 0x0000000000000007000000000000000700000000000000070000000000000007)
+                )
                 b3 := xor(mload(add(a, 0x200)), mload(add(dp, 0x20)))
-                b3 := or(and(shl(45, b3), 0xffffe00000000000ffffe00000000000ffffe00000000000ffffe00000000000), and(shr(19, b3), 0x00001fffffffffff00001fffffffffff00001fffffffffff00001fffffffffff))
+                b3 := or(
+                    and(shl(45, b3), 0xffffe00000000000ffffe00000000000ffffe00000000000ffffe00000000000),
+                    and(shr(19, b3), 0x00001fffffffffff00001fffffffffff00001fffffffffff00001fffffffffff)
+                )
                 b4 := xor(mload(add(a, 0x2c0)), mload(add(dp, 0x40)))
-                b4 := or(and(shl(61, b4), 0xe000000000000000e000000000000000e000000000000000e000000000000000), and(shr(3, b4), 0x1fffffffffffffff1fffffffffffffff1fffffffffffffff1fffffffffffffff))
+                b4 := or(
+                    and(shl(61, b4), 0xe000000000000000e000000000000000e000000000000000e000000000000000),
+                    and(shr(3, b4), 0x1fffffffffffffff1fffffffffffffff1fffffffffffffff1fffffffffffffff)
+                )
                 mstore(add(o, 0xa0), xor(b0, and(not(b1), b2)))
                 mstore(add(o, 0xc0), xor(b1, and(not(b2), b3)))
                 mstore(add(o, 0xe0), xor(b2, and(not(b3), b4)))
                 mstore(add(o, 0x100), xor(b3, and(not(b4), b0)))
                 mstore(add(o, 0x120), xor(b4, and(not(b0), b1)))
                 b0 := xor(mload(add(a, 0x20)), mload(add(dp, 0x20)))
-                b0 := or(and(shl(1, b0), 0xfffffffffffffffefffffffffffffffefffffffffffffffefffffffffffffffe), and(shr(63, b0), 0x0000000000000001000000000000000100000000000000010000000000000001))
+                b0 := or(
+                    and(shl(1, b0), 0xfffffffffffffffefffffffffffffffefffffffffffffffefffffffffffffffe),
+                    and(shr(63, b0), 0x0000000000000001000000000000000100000000000000010000000000000001)
+                )
                 b1 := xor(mload(add(a, 0xe0)), mload(add(dp, 0x40)))
-                b1 := or(and(shl(6, b1), 0xffffffffffffffc0ffffffffffffffc0ffffffffffffffc0ffffffffffffffc0), and(shr(58, b1), 0x000000000000003f000000000000003f000000000000003f000000000000003f))
+                b1 := or(
+                    and(shl(6, b1), 0xffffffffffffffc0ffffffffffffffc0ffffffffffffffc0ffffffffffffffc0),
+                    and(shr(58, b1), 0x000000000000003f000000000000003f000000000000003f000000000000003f)
+                )
                 b2 := xor(mload(add(a, 0x1a0)), mload(add(dp, 0x60)))
-                b2 := or(and(shl(25, b2), 0xfffffffffe000000fffffffffe000000fffffffffe000000fffffffffe000000), and(shr(39, b2), 0x0000000001ffffff0000000001ffffff0000000001ffffff0000000001ffffff))
+                b2 := or(
+                    and(shl(25, b2), 0xfffffffffe000000fffffffffe000000fffffffffe000000fffffffffe000000),
+                    and(shr(39, b2), 0x0000000001ffffff0000000001ffffff0000000001ffffff0000000001ffffff)
+                )
                 b3 := xor(mload(add(a, 0x260)), mload(add(dp, 0x80)))
-                b3 := or(and(shl(8, b3), 0xffffffffffffff00ffffffffffffff00ffffffffffffff00ffffffffffffff00), and(shr(56, b3), 0x00000000000000ff00000000000000ff00000000000000ff00000000000000ff))
+                b3 := or(
+                    and(shl(8, b3), 0xffffffffffffff00ffffffffffffff00ffffffffffffff00ffffffffffffff00),
+                    and(shr(56, b3), 0x00000000000000ff00000000000000ff00000000000000ff00000000000000ff)
+                )
                 b4 := xor(mload(add(a, 0x280)), mload(dp))
-                b4 := or(and(shl(18, b4), 0xfffffffffffc0000fffffffffffc0000fffffffffffc0000fffffffffffc0000), and(shr(46, b4), 0x000000000003ffff000000000003ffff000000000003ffff000000000003ffff))
+                b4 := or(
+                    and(shl(18, b4), 0xfffffffffffc0000fffffffffffc0000fffffffffffc0000fffffffffffc0000),
+                    and(shr(46, b4), 0x000000000003ffff000000000003ffff000000000003ffff000000000003ffff)
+                )
                 mstore(add(o, 0x140), xor(b0, and(not(b1), b2)))
                 mstore(add(o, 0x160), xor(b1, and(not(b2), b3)))
                 mstore(add(o, 0x180), xor(b2, and(not(b3), b4)))
                 mstore(add(o, 0x1a0), xor(b3, and(not(b4), b0)))
                 mstore(add(o, 0x1c0), xor(b4, and(not(b0), b1)))
                 b0 := xor(mload(add(a, 0x80)), mload(add(dp, 0x80)))
-                b0 := or(and(shl(27, b0), 0xfffffffff8000000fffffffff8000000fffffffff8000000fffffffff8000000), and(shr(37, b0), 0x0000000007ffffff0000000007ffffff0000000007ffffff0000000007ffffff))
+                b0 := or(
+                    and(shl(27, b0), 0xfffffffff8000000fffffffff8000000fffffffff8000000fffffffff8000000),
+                    and(shr(37, b0), 0x0000000007ffffff0000000007ffffff0000000007ffffff0000000007ffffff)
+                )
                 b1 := xor(mload(add(a, 0xa0)), mload(dp))
-                b1 := or(and(shl(36, b1), 0xfffffff000000000fffffff000000000fffffff000000000fffffff000000000), and(shr(28, b1), 0x0000000fffffffff0000000fffffffff0000000fffffffff0000000fffffffff))
+                b1 := or(
+                    and(shl(36, b1), 0xfffffff000000000fffffff000000000fffffff000000000fffffff000000000),
+                    and(shr(28, b1), 0x0000000fffffffff0000000fffffffff0000000fffffffff0000000fffffffff)
+                )
                 b2 := xor(mload(add(a, 0x160)), mload(add(dp, 0x20)))
-                b2 := or(and(shl(10, b2), 0xfffffffffffffc00fffffffffffffc00fffffffffffffc00fffffffffffffc00), and(shr(54, b2), 0x00000000000003ff00000000000003ff00000000000003ff00000000000003ff))
+                b2 := or(
+                    and(shl(10, b2), 0xfffffffffffffc00fffffffffffffc00fffffffffffffc00fffffffffffffc00),
+                    and(shr(54, b2), 0x00000000000003ff00000000000003ff00000000000003ff00000000000003ff)
+                )
                 b3 := xor(mload(add(a, 0x220)), mload(add(dp, 0x40)))
-                b3 := or(and(shl(15, b3), 0xffffffffffff8000ffffffffffff8000ffffffffffff8000ffffffffffff8000), and(shr(49, b3), 0x0000000000007fff0000000000007fff0000000000007fff0000000000007fff))
+                b3 := or(
+                    and(shl(15, b3), 0xffffffffffff8000ffffffffffff8000ffffffffffff8000ffffffffffff8000),
+                    and(shr(49, b3), 0x0000000000007fff0000000000007fff0000000000007fff0000000000007fff)
+                )
                 b4 := xor(mload(add(a, 0x2e0)), mload(add(dp, 0x60)))
-                b4 := or(and(shl(56, b4), 0xff00000000000000ff00000000000000ff00000000000000ff00000000000000), and(shr(8, b4), 0x00ffffffffffffff00ffffffffffffff00ffffffffffffff00ffffffffffffff))
+                b4 := or(
+                    and(shl(56, b4), 0xff00000000000000ff00000000000000ff00000000000000ff00000000000000),
+                    and(shr(8, b4), 0x00ffffffffffffff00ffffffffffffff00ffffffffffffff00ffffffffffffff)
+                )
                 mstore(add(o, 0x1e0), xor(b0, and(not(b1), b2)))
                 mstore(add(o, 0x200), xor(b1, and(not(b2), b3)))
                 mstore(add(o, 0x220), xor(b2, and(not(b3), b4)))
                 mstore(add(o, 0x240), xor(b3, and(not(b4), b0)))
                 mstore(add(o, 0x260), xor(b4, and(not(b0), b1)))
                 b0 := xor(mload(add(a, 0x40)), mload(add(dp, 0x40)))
-                b0 := or(and(shl(62, b0), 0xc000000000000000c000000000000000c000000000000000c000000000000000), and(shr(2, b0), 0x3fffffffffffffff3fffffffffffffff3fffffffffffffff3fffffffffffffff))
+                b0 := or(
+                    and(shl(62, b0), 0xc000000000000000c000000000000000c000000000000000c000000000000000),
+                    and(shr(2, b0), 0x3fffffffffffffff3fffffffffffffff3fffffffffffffff3fffffffffffffff)
+                )
                 b1 := xor(mload(add(a, 0x100)), mload(add(dp, 0x60)))
-                b1 := or(and(shl(55, b1), 0xff80000000000000ff80000000000000ff80000000000000ff80000000000000), and(shr(9, b1), 0x007fffffffffffff007fffffffffffff007fffffffffffff007fffffffffffff))
+                b1 := or(
+                    and(shl(55, b1), 0xff80000000000000ff80000000000000ff80000000000000ff80000000000000),
+                    and(shr(9, b1), 0x007fffffffffffff007fffffffffffff007fffffffffffff007fffffffffffff)
+                )
                 b2 := xor(mload(add(a, 0x1c0)), mload(add(dp, 0x80)))
-                b2 := or(and(shl(39, b2), 0xffffff8000000000ffffff8000000000ffffff8000000000ffffff8000000000), and(shr(25, b2), 0x0000007fffffffff0000007fffffffff0000007fffffffff0000007fffffffff))
+                b2 := or(
+                    and(shl(39, b2), 0xffffff8000000000ffffff8000000000ffffff8000000000ffffff8000000000),
+                    and(shr(25, b2), 0x0000007fffffffff0000007fffffffff0000007fffffffff0000007fffffffff)
+                )
                 b3 := xor(mload(add(a, 0x1e0)), mload(dp))
-                b3 := or(and(shl(41, b3), 0xfffffe0000000000fffffe0000000000fffffe0000000000fffffe0000000000), and(shr(23, b3), 0x000001ffffffffff000001ffffffffff000001ffffffffff000001ffffffffff))
+                b3 := or(
+                    and(shl(41, b3), 0xfffffe0000000000fffffe0000000000fffffe0000000000fffffe0000000000),
+                    and(shr(23, b3), 0x000001ffffffffff000001ffffffffff000001ffffffffff000001ffffffffff)
+                )
                 b4 := xor(mload(add(a, 0x2a0)), mload(add(dp, 0x20)))
-                b4 := or(and(shl(2, b4), 0xfffffffffffffffcfffffffffffffffcfffffffffffffffcfffffffffffffffc), and(shr(62, b4), 0x0000000000000003000000000000000300000000000000030000000000000003))
+                b4 := or(
+                    and(shl(2, b4), 0xfffffffffffffffcfffffffffffffffcfffffffffffffffcfffffffffffffffc),
+                    and(shr(62, b4), 0x0000000000000003000000000000000300000000000000030000000000000003)
+                )
                 mstore(add(o, 0x280), xor(b0, and(not(b1), b2)))
                 mstore(add(o, 0x2a0), xor(b1, and(not(b2), b3)))
                 mstore(add(o, 0x2c0), xor(b2, and(not(b3), b4)))
@@ -977,16 +1388,28 @@ library MLDSA65 {
     ///         (domain bits 1111, then pad10*1) at rate `rate`, finishing with the
     ///         permutation: lanes 0.. now hold the first squeezed block.
     function absorb(uint256 ks, uint256 src, uint256 len, uint256 rate) internal pure {
+        _absorbToFinal(ks, src, len, rate);
+        keccakF(ks);
+    }
+
+    /// @dev `absorb` minus its final permutation: every full block absorbed and
+    ///      permuted, the padded last block XORed into slot 0.
+    function _absorbToFinal(uint256 ks, uint256 src, uint256 len, uint256 rate) private pure {
         assembly ("memory-safe") {
             for { let o := 0 } lt(o, 0x320) { o := add(o, 0x20) } { mstore(add(ks, o), 0) }
         }
         while (len >= rate) {
-            _xorBlock(ks, src, rate);
+            _xorBlock(ks, src, rate, 0);
             keccakF(ks);
             src += rate;
             len -= rate;
         }
-        uint256 last;
+        _xorBlock(ks, _padLast(ks, src, len, rate), rate, 0);
+    }
+
+    /// @dev Stages src[0..len) (len < rate) with SHAKE padding as one rate-byte
+    ///      block in the scratch area; returns its address.
+    function _padLast(uint256 ks, uint256 src, uint256 len, uint256 rate) private pure returns (uint256 last) {
         assembly ("memory-safe") {
             last := add(ks, 0x320)
             for { let o := 0 } lt(o, 0xc0) { o := add(o, 0x20) } { mstore(add(last, o), 0) }
@@ -995,24 +1418,48 @@ library MLDSA65 {
             let fin := add(last, sub(rate, 1))
             mstore8(fin, or(byte(0, mload(fin)), 0x80)) // last pad bit (may share the byte)
         }
-        _xorBlock(ks, last, rate);
-        keccakF(ks);
     }
 
-    /// @notice XORs one `rate`-byte block at `src` into slot 0 of the state. Lanes are
+    /// @notice μ = SHAKE256(src[0..len)) truncated to 64 bytes (returned, from slot 0)
+    ///         AND SampleInBall's sponge SHAKE256(c̃) absorbed into slot 1 — in the
+    ///         same final permutation. The two hashes are independent and c̃
+    ///         (32 / 48 bytes) fits one SHAKE256 block, so riding along in an unused
+    ///         slot of the 4-way permutation saves SampleInBall's own permutation.
+    ///         Call `sampleInBall(…, 1)` next, before anything else uses `ks`.
+    /// @dev    Slot 1 is cleared first: after a multi-block μ input it holds
+    ///         whatever the earlier permutations made of it.
+    function shake256MuAndBall(uint256 ks, uint256 src, uint256 len, uint256 cTilde, uint256 cTildeBytes)
+        internal
+        pure
+        returns (bytes32 mu0, bytes32 mu1)
+    {
+        _absorbToFinal(ks, src, len, RATE256);
+        assembly ("memory-safe") {
+            let keep := not(shl(64, 0xffffffffffffffff))
+            for { let o := 0 } lt(o, 0x320) { o := add(o, 0x20) } {
+                let p := add(ks, o)
+                mstore(p, and(mload(p), keep))
+            }
+        }
+        _xorBlock(ks, _padLast(ks, cTilde, cTildeBytes, RATE256), RATE256, 64);
+        keccakF(ks);
+        return squeezeWords(ks);
+    }
+
+    /// @notice XORs one `rate`-byte block at `src` into slot sh/64 of the state. Lanes are
     ///         little-endian: each 32-byte load is byte-reversed within its four
     ///         64-bit groups, giving four lane values at once.
-    function _xorBlock(uint256 ks, uint256 src, uint256 rate) private pure {
+    function _xorBlock(uint256 ks, uint256 src, uint256 rate, uint256 sh) private pure {
         assembly ("memory-safe") {
             let lanes := shr(3, rate)
             for { let k := 0 } lt(k, lanes) { k := add(k, 4) } {
                 let w := _bswap64x4(mload(add(src, shl(3, k))))
                 let p := add(ks, shl(5, k))
-                mstore(p, xor(mload(p), shr(192, w)))
+                mstore(p, xor(mload(p), shl(sh, shr(192, w))))
                 if lt(add(k, 1), lanes) {
-                    mstore(add(p, 0x20), xor(mload(add(p, 0x20)), and(shr(128, w), 0xffffffffffffffff)))
-                    mstore(add(p, 0x40), xor(mload(add(p, 0x40)), and(shr(64, w), 0xffffffffffffffff)))
-                    mstore(add(p, 0x60), xor(mload(add(p, 0x60)), and(w, 0xffffffffffffffff)))
+                    mstore(add(p, 0x20), xor(mload(add(p, 0x20)), shl(sh, and(shr(128, w), 0xffffffffffffffff))))
+                    mstore(add(p, 0x40), xor(mload(add(p, 0x40)), shl(sh, and(shr(64, w), 0xffffffffffffffff))))
+                    mstore(add(p, 0x60), xor(mload(add(p, 0x60)), shl(sh, and(w, 0xffffffffffffffff))))
                 }
             }
 
@@ -1095,8 +1542,7 @@ library MLDSA65 {
     /// @dev zetas[m] = ζ^{BitRev8(m)} mod q, ζ = 1753 (FIPS 204 Appendix B), as
     ///      256 big-endian uint32. Entry 0 (= 1) is never read by the transforms.
     function _zetas() internal pure returns (bytes memory) {
-        return
-            hex"0000000100495e020039756700396569004f062b0053df73004fe033004f066b"
+        return hex"0000000100495e020039756700396569004f062b0053df73004fe033004f066b"
             hex"0076b1ae00360dd50028edb000207fe4003972830070894a00088192006d3dc8"
             hex"004c72940041e0b40028a3d20066528a004a18a700794034000a52ee006b7d81"
             hex"004e9f1d001a2877002571df001649ee007611bd00492bb7002af6970022d8d5"

@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-"""Fixture generator for contracts/test/MLDSA65.t.sol.
+"""Fixture generator for contracts/test/MLDSA.t.sol and MLDSAVerifier.t.sol.
 
-Writes three JSON files next to this script:
+Writes three JSON files next to this script. differential.json and acvp.json
+hold one object per parameter set, under the keys "mldsa44" and "mldsa65":
 
-  differential.json  ML-DSA-65 key/message/context/signature tuples produced by
+  differential.json  ML-DSA key/message/context/signature tuples produced by
                      dilithium-py 1.4.0 (the version these fixtures were made with;
                      pip install dilithium-py, MIT, a pure-Python
                      FIPS 204 implementation), plus per-vector intermediates
                      (tr, mu, w1Encode(w1'), A_hat[0][0]) so a failing
                      Solidity run can be pinned to one phase. Also a few
                      hand-built malformed signatures (see `malformed`), and the
-                     expected `MLDSA65.precompute` blob of vector 1 (`blob1`:
+                     expected `MLDSA.precompute` blob of vector 1 (`blob1`:
                      tr || A_hat || NTT(t1*2^d) mod q, 3 bytes/coef big-endian).
-  acvp.json          The ML-DSA-65 sigVer cases from NIST's ACVP-Server, trimmed
-                     to the groups the library exposes:
-                       tgId 3  external interface, pure (no pre-hash)  -> verifyWithContext
-                       tgId 10 internal interface, externalMu = false  -> verifyInternal
+  acvp.json          The sigVer cases from NIST's ACVP-Server, trimmed to the
+                     groups the library exposes:
+                       external interface, pure (no pre-hash)  -> verifyWithContext
+                         ML-DSA-44: tgId 1   ML-DSA-65: tgId 3
+                       internal interface, externalMu = false  -> verifyInternal
+                         ML-DSA-44: tgId 8   ML-DSA-65: tgId 10
                      Each case keeps tcId, expected result and NIST's reason text.
   shake.json         SHAKE128 / SHAKE256 outputs from hashlib, for testing the
                      Keccak sponge independently of ML-DSA.
+
+The "mldsa65" objects are exactly the contents of the single-set ML-DSA-65
+fixtures these files replaced (same seeds, same cases).
 
 ACVP source (pinned; the three files are fetched at this commit):
   https://github.com/usnistgov/ACVP-Server/tree/a7f283cdc87d2d6dd93c1bac59e5622c5f9f8324/gen-val/json-files/ML-DSA-sigVer-FIPS204
@@ -36,7 +42,7 @@ import os
 import sys
 import urllib.request
 
-from dilithium_py.ml_dsa import ML_DSA_65
+from dilithium_py.ml_dsa import ML_DSA_44, ML_DSA_65
 
 ACVP_COMMIT = "a7f283cdc87d2d6dd93c1bac59e5622c5f9f8324"
 ACVP_URL = (
@@ -47,7 +53,13 @@ ACVP_URL = (
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 Q = 8380417
-K, L, OMEGA = 6, 5, 55
+
+# Per parameter set: the dilithium-py object, FIPS 204 sizes, the precompute
+# blob length (64 + k*l*768 + k*768) and the ACVP test groups (external, internal).
+SETS = {
+    "mldsa44": dict(d=ML_DSA_44, name="ML-DSA-44", pk=1312, sig=2420, blob=15424, tg=(1, 8)),
+    "mldsa65": dict(d=ML_DSA_65, name="ML-DSA-65", pk=1952, sig=3309, blob=27712, tg=(3, 10)),
+}
 
 
 def hx(b: bytes) -> str:
@@ -58,9 +70,8 @@ def m_prime(ctx: bytes, msg: bytes) -> bytes:
     return bytes([0, len(ctx)]) + ctx + msg
 
 
-def intermediates(pk: bytes, ctx: bytes, msg: bytes, sig: bytes) -> dict:
+def intermediates(d, pk: bytes, ctx: bytes, msg: bytes, sig: bytes) -> dict:
     """Re-runs Algorithm 8 step by step with dilithium-py's own internals."""
-    d = ML_DSA_65
     rho, t1 = d._unpack_pk(pk)
     c_tilde, z, h = d._unpack_sig(sig)
     a_hat = d._expand_matrix_from_seed(rho)
@@ -72,7 +83,7 @@ def intermediates(pk: bytes, ctx: bytes, msg: bytes, sig: bytes) -> dict:
     w = ((a_hat @ zh) - t1h.scale(c)).from_ntt()
     w1 = h.use_hint(w, 2 * d.gamma_2)
     w1_bytes = w1.bit_pack_w(d.gamma_2)
-    assert d._h(mu + w1_bytes, 48) == c_tilde
+    assert d._h(mu + w1_bytes, d.c_tilde_bytes) == c_tilde
     return {
         "tr": hx(tr),
         "mu": hx(mu),
@@ -82,21 +93,22 @@ def intermediates(pk: bytes, ctx: bytes, msg: bytes, sig: bytes) -> dict:
     }
 
 
-def precompute_blob(pk: bytes) -> bytes:
-    """tr || A_hat (30 polys) || NTT(t1 * 2^d) mod q (6 polys); 3-byte BE coefficients."""
-    d = ML_DSA_65
+def precompute_blob(p: dict, pk: bytes) -> bytes:
+    """tr || A_hat (k*l polys) || NTT(t1 * 2^d) mod q (k polys); 3-byte BE coefficients."""
+    d = p["d"]
     rho, t1 = d._unpack_pk(pk)
     a_hat = d._expand_matrix_from_seed(rho)
     t_hat = t1.scale(1 << d.d).to_ntt()
     pack = lambda poly: b"".join((c % Q).to_bytes(3, "big") for c in poly.coeffs)
     out = d._h(pk, 64)
-    out += b"".join(pack(a_hat[i, j]) for i in range(K) for j in range(L))
-    out += b"".join(pack(t_hat[i, 0]) for i in range(K))
-    assert len(out) == 27712
+    out += b"".join(pack(a_hat[i, j]) for i in range(d.k) for j in range(d.l))
+    out += b"".join(pack(t_hat[i, 0]) for i in range(d.k))
+    assert len(out) == p["blob"]
     return out
 
 
-def differential() -> dict:
+def differential(p: dict) -> dict:
+    d = p["d"]
     cases = [
         # (key seed byte, ctx, message)
         (1, b"", b""),
@@ -110,11 +122,11 @@ def differential() -> dict:
     ]
     out = {k: [] for k in ("pk", "ctx", "msg", "sig", "tr", "mu", "w1", "a00")}
     for seed, ctx, msg in cases:
-        pk, sk = ML_DSA_65.key_derive(bytes([seed]) * 32)
-        sig = ML_DSA_65.sign(sk, msg, ctx=ctx, deterministic=True)
-        assert ML_DSA_65.verify(pk, msg, sig, ctx=ctx)
-        assert len(pk) == 1952 and len(sig) == 3309
-        inter = intermediates(pk, ctx, msg, sig)
+        pk, sk = d.key_derive(bytes([seed]) * 32)
+        sig = d.sign(sk, msg, ctx=ctx, deterministic=True)
+        assert d.verify(pk, msg, sig, ctx=ctx)
+        assert len(pk) == p["pk"] and len(sig) == p["sig"]
+        inter = intermediates(d, pk, ctx, msg, sig)
         for k, v in (("pk", pk), ("ctx", ctx), ("msg", msg), ("sig", sig)):
             out[k].append(hx(v))
         for k, v in inter.items():
@@ -122,12 +134,12 @@ def differential() -> dict:
     return out
 
 
-def hint_offsets(sig: bytes):
-    h = sig[-(OMEGA + K):]
-    return list(h[:OMEGA]), list(h[OMEGA:])
+def hint_offsets(d, sig: bytes):
+    h = sig[-(d.omega + d.k):]
+    return list(h[:d.omega]), list(h[d.omega:])
 
 
-def malformed(pk: bytes, msg: bytes, sig: bytes) -> dict:
+def malformed(d, pk: bytes, msg: bytes, sig: bytes) -> dict:
     """Signatures whose hint encoding FIPS 204 Algorithm 21 rejects.
 
     `duplicate`: one hint index repeated within a row (all later row offsets
@@ -137,34 +149,34 @@ def malformed(pk: bytes, msg: bytes, sig: bytes) -> dict:
     DECREASING indices and therefore accepts this signature (recorded below as
     `dilithiumPyAccepts`); FIPS 204 requires rejection (strong unforgeability).
     """
-    idx, offs = hint_offsets(sig)
+    idx, offs = hint_offsets(d, sig)
     total = offs[-1]
-    assert total < OMEGA, "need room for one more hint index"
+    assert total < d.omega, "need room for one more hint index"
     # Pick the first non-empty row.
-    row = next(i for i in range(K) if offs[i] > (offs[i - 1] if i else 0))
+    row = next(i for i in range(d.k) if offs[i] > (offs[i - 1] if i else 0))
     start = offs[row - 1] if row else 0
     dup_at = start  # duplicate the row's first index
     new_idx = idx[:dup_at + 1] + idx[dup_at:total]
-    new_idx += [0] * (OMEGA - len(new_idx))
+    new_idx += [0] * (d.omega - len(new_idx))
     new_offs = [o + 1 if i >= row else o for i, o in enumerate(offs)]
-    dup = sig[: -(OMEGA + K)] + bytes(new_idx) + bytes(new_offs)
+    dup = sig[: -(d.omega + d.k)] + bytes(new_idx) + bytes(new_offs)
     assert len(dup) == len(sig)
     return {
         "duplicate": hx(dup),
-        "dilithiumPyAccepts": bool(ML_DSA_65.verify(pk, msg, dup)),
+        "dilithiumPyAccepts": bool(d.verify(pk, msg, dup)),
         "pk": hx(pk),
         "msg": hx(msg),
         "sig": hx(sig),
     }
 
 
-def acvp(path: str) -> dict:
-    src = json.load(open(path))
+def acvp(p: dict, src: dict) -> dict:
+    d = p["d"]
     groups = {g["tgId"]: g for g in src["testGroups"]}
     out = {}
-    for tg, name, iface in ((3, "external", "external"), (10, "internal", "internal")):
+    for tg, name, iface in ((p["tg"][0], "external", "external"), (p["tg"][1], "internal", "internal")):
         g = groups[tg]
-        assert g["parameterSet"] == "ML-DSA-65" and g["signatureInterface"] == iface
+        assert g["parameterSet"] == p["name"] and g["signatureInterface"] == iface
         if iface == "external":
             assert g["preHash"] == "pure"
         else:
@@ -175,9 +187,9 @@ def acvp(path: str) -> dict:
             ctx = bytes.fromhex(t.get("context") or "")
             # Cross-check NIST's expectation against the Python reference.
             if iface == "external":
-                got = ML_DSA_65.verify(pk, msg, sig, ctx=ctx)
+                got = d.verify(pk, msg, sig, ctx=ctx)
             else:
-                got = ML_DSA_65._verify_internal(pk, msg, sig)
+                got = d._verify_internal(pk, msg, sig)
             assert got == t["testPassed"], (tg, t["tcId"])
             rows["tcId"].append(t["tcId"])
             rows["pk"].append(hx(pk))
@@ -187,7 +199,6 @@ def acvp(path: str) -> dict:
             rows["passed"].append(t["testPassed"])
             rows["reason"].append(t["reason"])
         out[name] = rows
-    out["source"] = ACVP_URL
     return out
 
 
@@ -209,17 +220,23 @@ def main():
     else:
         ip = os.path.join(HERE, ".internalProjection.json")
         urllib.request.urlretrieve(ACVP_URL, ip)
-    diff = differential()
-    pk, msg, sig = (bytes.fromhex(diff[k][1][2:]) for k in ("pk", "msg", "sig"))
-    diff["malformed"] = malformed(pk, msg, sig)
-    diff["blob1"] = hx(precompute_blob(pk))
-    for name, obj in (("differential", diff), ("acvp", acvp(ip)), ("shake", shake())):
+    src = json.load(open(ip))
+    diffs, acvps = {}, {"source": ACVP_URL}
+    for key, p in SETS.items():
+        diff = differential(p)
+        pk, msg, sig = (bytes.fromhex(diff[k][1][2:]) for k in ("pk", "msg", "sig"))
+        diff["malformed"] = malformed(p["d"], pk, msg, sig)
+        diff["blob1"] = hx(precompute_blob(p, pk))
+        diffs[key] = diff
+        acvps[key] = acvp(p, src)
+    for name, obj in (("differential", diffs), ("acvp", acvps), ("shake", shake())):
         with open(os.path.join(HERE, name + ".json"), "w") as f:
             json.dump(obj, f, indent=1)
             f.write("\n")
     if len(sys.argv) == 1:
         os.remove(ip)
-    print("ok; dilithium-py accepts duplicate-index hint:", diff["malformed"]["dilithiumPyAccepts"])
+    for key in SETS:
+        print(key, "ok; dilithium-py accepts duplicate-index hint:", diffs[key]["malformed"]["dilithiumPyAccepts"])
 
 
 if __name__ == "__main__":
