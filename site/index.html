@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mldsa-solidity — NIST's post-quantum signatures, verified on-chain</title>
+<meta name="description" content="FIPS 204 ML-DSA-44 and ML-DSA-65 signature verification in pure Solidity. Tested against NIST's ACVP vectors. 2.68M gas per verification. One swappable interface. MIT.">
+<link rel="canonical" href="https://skalenetwork.github.io/mldsa-solidity/">
+<meta name="theme-color" content="#0b0f14">
+<meta property="og:type" content="website">
+<meta property="og:title" content="mldsa-solidity — NIST's post-quantum signatures, verified on-chain">
+<meta property="og:description" content="FIPS 204 ML-DSA verification in pure Solidity, tested against NIST's ACVP vectors. 2.68M gas. MIT.">
+<meta property="og:url" content="https://skalenetwork.github.io/mldsa-solidity/">
+<meta property="og:image" content="https://skalenetwork.github.io/mldsa-solidity/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="mldsa-solidity — NIST's post-quantum signatures, verified on-chain">
+<meta name="twitter:description" content="FIPS 204 ML-DSA verification in pure Solidity, tested against NIST's ACVP vectors. 2.68M gas. MIT.">
+<meta name="twitter:image" content="https://skalenetwork.github.io/mldsa-solidity/og-image.png">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<style>
+  :root {
+    --bg:#0b0f14; --bg2:#111720; --card:#141b24; --line:#222c39;
+    --ink:#e9eef5; --dim:#97a3b4; --dimmer:#6d7887;
+    --accent:#a78bfa; --accent2:#38bdf8; --warn:#fbbf24; --ok:#4ade80;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing:border-box; }
+  html { scroll-behavior:smooth; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing:antialiased; overflow-x:hidden;
+  }
+  a { color:var(--accent2); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .wrap { width:100%; max-width:1080px; margin:0 auto; padding:0 20px; }
+  h1, h2, h3 { line-height:1.2; letter-spacing:-0.02em; margin:0 0 16px; }
+  h1 { font-size:clamp(34px, 6vw, 60px); font-weight:800; }
+  h2 { font-size:clamp(26px, 4vw, 38px); font-weight:700; }
+  h3 { font-size:19px; font-weight:650; }
+  p { margin:0 0 16px; color:var(--dim); }
+  .lead { font-size:clamp(17px, 2.2vw, 21px); color:var(--dim); max-width:46em; }
+  .grad { background:linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip:text; background-clip:text; color:transparent; }
+  code, pre { font-family:var(--mono); }
+  pre {
+    background:var(--bg2); border:1px solid var(--line); border-radius:12px;
+    padding:16px 18px; overflow-x:auto; font-size:13.5px; line-height:1.6; margin:0 0 16px;
+  }
+  pre .c { color:var(--dimmer); }
+  pre .k { color:var(--accent2); }
+  pre .s { color:var(--accent); }
+  p code, li code, td code { background:var(--bg2); border:1px solid var(--line);
+    border-radius:6px; padding:1px 6px; font-size:0.9em; color:var(--ink); }
+
+  header.nav { position:sticky; top:0; z-index:10; background:rgba(11,15,20,.88);
+    backdrop-filter:blur(8px); border-bottom:1px solid var(--line); }
+  .nav-in { display:flex; align-items:center; gap:18px; height:60px; }
+  .brand { display:flex; align-items:center; gap:10px; font-weight:700; color:var(--ink); }
+  .brand svg { flex:none; }
+  .nav-links { margin-left:auto; display:flex; gap:20px; align-items:center; font-size:14.5px; }
+  .nav-links a { color:var(--dim); }
+  .nav-links a:hover { color:var(--ink); text-decoration:none; }
+  @media (max-width:640px){ .nav-links .hide-sm { display:none; } }
+  section { padding:72px 0; border-bottom:1px solid var(--line); }
+  section.hero { padding:84px 0 68px; border-bottom:none; }
+  .badges { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:22px; }
+  .badge { display:inline-flex; align-items:center; gap:6px; font-size:12.5px; font-weight:600;
+    padding:5px 11px; border-radius:999px; border:1px solid var(--line); background:var(--bg2); color:var(--dim); }
+  .badge.ok { color:var(--ok); border-color:rgba(74,222,128,.35); background:rgba(74,222,128,.08); }
+  .badge.pq { color:var(--accent); border-color:rgba(167,139,250,.4); background:rgba(167,139,250,.09); }
+  .badge.warn { color:var(--warn); border-color:rgba(251,191,36,.35); background:rgba(251,191,36,.07); }
+  .cta { display:flex; flex-wrap:wrap; gap:12px; margin:26px 0 0; }
+  .btn { display:inline-flex; align-items:center; gap:8px; font-weight:650; font-size:15px;
+    padding:12px 20px; border-radius:10px; border:1px solid var(--line); color:var(--ink); background:var(--card); }
+  .btn:hover { border-color:var(--dimmer); text-decoration:none; }
+  .btn.primary { background:var(--accent); color:#160c33; border-color:var(--accent); }
+  .btn.primary:hover { filter:brightness(1.08); }
+  .stats { display:grid; grid-template-columns:repeat(4, 1fr); gap:14px; margin-top:44px; }
+  @media (max-width:820px){ .stats { grid-template-columns:repeat(2, 1fr); } }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; }
+  .stat .v { font-size:clamp(20px, 3vw, 26px); font-weight:750; letter-spacing:-0.02em; }
+  .stat .l { font-size:13px; color:var(--dim); margin-top:4px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:26px; align-items:start; }
+  .grid2 > *, .cards > *, .stats > * { min-width:0; }
+  @media (max-width:820px){ .grid2 { grid-template-columns:1fr; } }
+  .cards { display:grid; grid-template-columns:repeat(3, 1fr); gap:16px; margin-top:28px; }
+  @media (max-width:900px){ .cards { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; }
+  .card p:last-child { margin-bottom:0; }
+  table { width:100%; border-collapse:collapse; font-size:14.5px; margin-top:8px; }
+  th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-size:12.5px; text-transform:uppercase; letter-spacing:.06em; font-weight:650; }
+  td:first-child { white-space:nowrap; }
+  td.num { font-family:var(--mono); color:var(--ink); }
+  .scroll-x { overflow-x:auto; }
+  @media (max-width:640px){ td:first-child { white-space:normal; } }
+  ol.steps { counter-reset:s; list-style:none; padding:0; margin:0; }
+  ol.steps li { position:relative; padding-left:44px; margin-bottom:18px; color:var(--dim); }
+  ol.steps li::before { counter-increment:s; content:counter(s); position:absolute; left:0; top:-1px;
+    width:28px; height:28px; border-radius:50%; background:var(--bg2); border:1px solid var(--line);
+    color:var(--accent); font-weight:700; font-size:14px; display:grid; place-items:center; }
+  ol.steps b { color:var(--ink); }
+  .pipe { display:flex; flex-wrap:wrap; gap:10px; align-items:stretch; margin-top:20px; }
+  .pipe .step { flex:1 1 150px; background:var(--card); border:1px solid var(--line);
+    border-radius:12px; padding:14px; min-width:0; }
+  .pipe .step .t { font-weight:650; font-size:14.5px; }
+  .pipe .step .d { font-size:12.5px; color:var(--dim); margin-top:4px; }
+  .pipe .step .lem { font-size:11.5px; color:var(--accent); margin-top:8px; font-family:var(--mono); }
+  details { border:1px solid var(--line); border-radius:12px; background:var(--card);
+    padding:14px 18px; margin-bottom:10px; }
+  details summary { cursor:pointer; font-weight:650; color:var(--ink); }
+  details[open] summary { margin-bottom:10px; }
+  details p:last-child { margin-bottom:0; }
+  .note { border-left:3px solid var(--warn); background:rgba(251,191,36,.07);
+    padding:14px 18px; border-radius:0 10px 10px 0; }
+  .note strong { color:var(--warn); }
+  footer { padding:44px 0 60px; color:var(--dimmer); font-size:14px; }
+  footer a { color:var(--dim); }
+  .foot-links { display:flex; flex-wrap:wrap; gap:18px; margin-bottom:18px; }
+</style>
+</head>
+<body>
+<header class="nav">
+  <div class="wrap nav-in">
+    <span class="brand">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <circle cx="6" cy="6" r="2" fill="#a78bfa"/><circle cx="12" cy="6" r="2" fill="#a78bfa"/><circle cx="18" cy="6" r="2" fill="#a78bfa"/>
+        <circle cx="6" cy="12" r="2" fill="#a78bfa"/><circle cx="12" cy="12" r="2.6" fill="#38bdf8"/><circle cx="18" cy="12" r="2" fill="#a78bfa"/>
+        <circle cx="6" cy="18" r="2" fill="#a78bfa"/><circle cx="12" cy="18" r="2" fill="#a78bfa"/><circle cx="18" cy="18" r="2" fill="#a78bfa"/>
+      </svg>
+      mldsa-solidity
+    </span>
+    <nav class="nav-links">
+      <a class="hide-sm" href="#why">Why</a>
+      <a href="#how">How</a>
+      <a class="hide-sm" href="#gas">Gas</a>
+      <a href="#trust">Testing</a>
+      <a class="hide-sm" href="#start">Quickstart</a>
+      <a href="https://github.com/skalenetwork/mldsa-solidity">GitHub</a>
+    </nav>
+  </div>
+</header>
+<main>
+<section class="hero">
+  <div class="wrap">
+    <div class="badges">
+      <span class="badge pq">NIST FIPS 204</span>
+      <span class="badge ok">Tested against NIST ACVP vectors</span>
+      <span class="badge">ML-DSA-44 · ML-DSA-65</span>
+      <span class="badge">MIT</span>
+      <span class="badge warn">Unaudited</span>
+    </div>
+    <h1>NIST's post-quantum signature,<br><span class="grad">verified on-chain.</span></h1>
+    <p class="lead">
+      <strong>mldsa-solidity</strong> verifies <a href="https://csrc.nist.gov/pubs/fips/204/final">ML-DSA</a>
+      (FIPS 204, formerly CRYSTALS-Dilithium) signatures entirely inside the EVM, in pure Solidity. ML-DSA is
+      the lattice signature NIST chose as the primary replacement for ECDSA, and the one hardware wallets and
+      HSMs are starting to sign with. This library lets a contract check those signatures today, with no
+      precompile and no new chain.
+    </p>
+<pre><code><span class="k">import</span> {IMLDSAVerifier, ML_DSA_44} <span class="k">from</span> <span class="s">"mldsa-solidity/IMLDSAVerifier.sol"</span>;
+<span class="c">// true iff sig is a valid ML-DSA-44 signature on message under publicKey</span>
+<span class="k">bool</span> ok = verifier.verify(ML_DSA_44, publicKey, message, sig);</code></pre>
+    <div class="cta">
+      <a class="btn primary" href="#start">Get started</a>
+      <a class="btn" href="https://github.com/skalenetwork/mldsa-solidity">Source on GitHub</a>
+      <a class="btn" href="#trust">How it is tested</a>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="v">2.68M</div><div class="l">gas per ML-DSA-44 verification (key registered)</div></div>
+      <div class="stat"><div class="v">3.66M</div><div class="l">gas per ML-DSA-65 verification (key registered)</div></div>
+      <div class="stat"><div class="v">NIST ACVP</div><div class="l">official test vectors, passing and failing cases, both sets</div></div>
+      <div class="stat"><div class="v">never reverts</div><div class="l">malformed input of any kind returns <code>false</code></div></div>
+    </div>
+  </div>
+</section>
+
+<section id="why">
+  <div class="wrap">
+    <h2>Why this exists</h2>
+    <div class="grid2">
+      <div>
+        <p>
+          A large enough quantum computer breaks ECDSA, and with it every Ethereum account, multisig and bridge key.
+          NIST's answer, standardised in 2024, is ML-DSA: a lattice signature with small keys, fast signing, and
+          no state to track, so a key can sign as often as it likes and can be restored from a backup.
+        </p>
+        <p>
+          Ethereum has no ML-DSA precompile. A draft proposal for one exists (EIP-8051), but it is not scheduled.
+          Until it ships, the only way for a contract to accept an ML-DSA signature is to verify it in Solidity.
+          That is what this library does, within one transaction's gas budget.
+        </p>
+      </div>
+      <div class="card">
+        <h3>What you get</h3>
+        <div class="scroll-x">
+        <table>
+          <tr><td>Standard</td><td>FIPS 204 ML-DSA.Verify (Algorithm 3), the pure variant, with a context string</td></tr>
+          <tr><td>Parameter sets</td><td>ML-DSA-44 (default) and ML-DSA-65, chosen per call</td></tr>
+          <tr><td>Primitives</td><td>SHAKE128 and SHAKE256 on a Keccak-f[1600] permutation in Yul; NTT over Z<sub>q</sub></td></tr>
+          <tr><td>Interface</td><td><code>IMLDSAVerifier</code>, one swappable verifier, ERC-165</td></tr>
+          <tr><td>Failure mode</td><td>Returns <code>false</code>, never reverts</td></tr>
+          <tr><td>Licence</td><td>MIT</td></tr>
+        </table>
+        </div>
+      </div>
+    </div>
+    <div class="cards">
+      <div class="card">
+        <h3>Swappable by design</h3>
+        <p>Contracts depend on <code>IMLDSAVerifier</code>, never on this implementation. When an ML-DSA precompile or
+        an audited verifier ships, an adapter takes its place behind the same call, with no redesign.</p>
+      </div>
+      <div class="card">
+        <h3>Precomputed keys</h3>
+        <p>Everything a verification needs that depends only on the public key is computed once, on-chain, and stored
+        as contract code. That cuts ML-DSA-65 verification from about 9M gas to 3.66M.</p>
+      </div>
+      <div class="card">
+        <h3>Trust by address</h3>
+        <p>Precomputed data lives at a CREATE2 address derived from the key's hash, and only the factory can write
+        there. A caller stores 32 bytes and trusts the data because of where it is.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <h2>How a verification runs</h2>
+    <p class="lead">FIPS 204 Algorithm 8, step by step, entirely in the EVM.</p>
+    <div class="pipe">
+      <div class="step"><div class="t">Decode</div><div class="d">Unpack c̃, z and the hints; reject a malformed or out-of-range signature</div><div class="lem">‖z‖∞ &lt; γ₁ − β</div></div>
+      <div class="step"><div class="t">Expand A</div><div class="d">Sample the public matrix from ρ with SHAKE128, or read it precomputed</div><div class="lem">ExpandA(ρ)</div></div>
+      <div class="step"><div class="t">Multiply</div><div class="d">Compute A·z − c·t₁·2<sup>d</sup> in the NTT domain</div><div class="lem">NTT⁻¹(Â∘ẑ − ĉ∘t̂₁)</div></div>
+      <div class="step"><div class="t">Use hints</div><div class="d">Recover the signer's high bits w₁ from the hints</div><div class="lem">UseHint(h, w′)</div></div>
+      <div class="step"><div class="t">Compare</div><div class="d">Hash μ with w₁ and check it equals the signature's challenge</div><div class="lem">c̃ = H(μ ‖ w₁)</div></div>
+    </div>
+    <h3 style="margin-top:40px">Setting up a key</h3>
+    <ol class="steps">
+      <li><b><code>registerT(set, pk)</code></b>: compute <code>tr</code> and <code>NTT(t₁·2<sup>d</sup>)</code> from the key and store them.</li>
+      <li><b><code>registerA(set, pk)</code></b>: compute the matrix <code>Â</code> and store it. Or split it: <b><code>commitA</code></b> computes it and records only its hash, and <b><code>storeA</code></b> stores the bytes later, accepted only if they match. That keeps a wallet's whole setup inside one transaction.</li>
+      <li><b>Verify.</b> <code>MLDSAVerifier</code> takes the fast path when the key's data is registered, and verifies from scratch when it isn't. Both paths give the same answer.</li>
+    </ol>
+  </div>
+</section>
+
+<section id="gas">
+  <div class="wrap">
+    <h2>Gas</h2>
+    <p>Measured with <code>forge test</code> at 32-byte messages. Everything fits under the EIP-7825 per-transaction cap of 2<sup>24</sup> gas.</p>
+    <div class="scroll-x">
+    <table>
+      <tr><th></th><th>ML-DSA-44</th><th>ML-DSA-65</th></tr>
+      <tr><td>Verify, key registered (through <code>IMLDSAVerifier</code>)</td><td class="num">2.68M</td><td class="num">3.66M</td></tr>
+      <tr><td>Verify, key not registered (full computation)</td><td class="num">5.75M</td><td class="num">9.13M</td></tr>
+      <tr><td><code>registerA</code> / <code>registerT</code></td><td class="num">5.54M / 2.29M</td><td class="num">10.59M / 3.38M</td></tr>
+      <tr><td><code>commitA</code> / <code>storeA</code></td><td class="num">2.88M / 2.88M</td><td class="num">5.63M / 5.34M</td></tr>
+    </table>
+    </div>
+    <p style="margin-top:16px">Sign a 32-byte digest, such as an EIP-712 hash. Each extra 136 bytes of message adds about 89k gas.</p>
+  </div>
+</section>
+
+<section id="trust">
+  <div class="wrap">
+    <h2>Why you should believe it</h2>
+    <div class="cards">
+      <div class="card">
+        <h3>NIST's own vectors</h3>
+        <p>The official ACVP <code>ML-DSA-sigVer-FIPS204</code> vectors for both sets, external and internal interfaces,
+        including every case NIST expects to fail. Pinned at
+        <code>usnistgov/ACVP-Server@a7f283c</code>.</p>
+      </div>
+      <div class="card">
+        <h3>An independent implementation</h3>
+        <p>Differential vectors from <a href="https://github.com/GiacomoPope/dilithium-py">dilithium-py</a>, compared byte
+        for byte, intermediate values and precomputed data included. One script regenerates every fixture.</p>
+      </div>
+      <div class="card">
+        <h3>Stricter than the reference</h3>
+        <p>dilithium-py accepts a repeated hint index, which FIPS 204 Algorithm 21 forbids. This library rejects it, as
+        the standard requires, and a test pins the difference.</p>
+      </div>
+    </div>
+    <p style="margin-top:24px">Plus negative tests for bit flips, wrong lengths, every hint-encoding rule, the exact
+    <code>‖z‖∞</code> boundary and keys used under the wrong parameter set, and fuzzing.</p>
+    <div class="note" style="margin-top:20px">
+      <strong>Unaudited.</strong> This is new cryptographic code. It passes NIST's vectors and agrees with an
+      independent implementation, but no third party has reviewed it. Weigh that before securing value with it.
+    </div>
+  </div>
+</section>
+
+<section id="start">
+  <div class="wrap">
+    <h2>Quickstart</h2>
+<pre><code><span class="c"># add the library to a Foundry project</span>
+forge install skalenetwork/mldsa-solidity
+<span class="c"># remappings.txt</span>
+mldsa-solidity/=lib/mldsa-solidity/src/
+@openzeppelin/contracts/=lib/mldsa-solidity/lib/openzeppelin-contracts/contracts/</code></pre>
+<pre><code><span class="k">import</span> {IMLDSAVerifier, ParamSet, ML_DSA_44} <span class="k">from</span> <span class="s">"mldsa-solidity/IMLDSAVerifier.sol"</span>;
+
+<span class="k">contract</span> Vault {
+    IMLDSAVerifier <span class="k">public immutable</span> verifier;   <span class="c">// fixed at deployment</span>
+
+    <span class="k">constructor</span>(IMLDSAVerifier v) { verifier = v; }
+
+    <span class="k">function</span> check(<span class="k">bytes calldata</span> pk, <span class="k">bytes32</span> digest, <span class="k">bytes calldata</span> sig) <span class="k">external view returns</span> (<span class="k">bool</span>) {
+        <span class="k">return</span> verifier.verify(ML_DSA_44, pk, <span class="k">abi</span>.encodePacked(digest), sig);
+    }
+}</code></pre>
+    <p>Deploy <code>MLDSAKeyFactory</code> and <code>MLDSAVerifier</code> once, register each key with the factory for the fast
+    path, and run <code>forge test</code> to see every vector pass.</p>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-links">
+      <a href="https://github.com/skalenetwork/mldsa-solidity">GitHub</a>
+      <a href="https://github.com/skalenetwork/mldsa-solidity/blob/main/README.md">README</a>
+      <a href="https://csrc.nist.gov/pubs/fips/204/final">FIPS 204</a>
+      <a href="https://skalenetwork.github.io/xmss-solidity/">xmss-solidity (XMSS)</a>
+      <a href="https://skalenetwork.github.io/fermionwallet/">Fermion</a>
+    </div>
+    <p>MIT licensed. Written for <a href="https://skalenetwork.github.io/fermionwallet/">Fermion</a>, the hybrid
+    ECDSA + ML-DSA wallet and Safe guard, and published separately so any project can use it.</p>
+  </div>
+</footer>
+</body>
+</html>
