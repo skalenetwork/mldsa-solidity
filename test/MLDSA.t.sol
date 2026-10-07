@@ -344,6 +344,7 @@ contract SquatterCreate2 {
 contract MLDSATest is Test {
     MLDSAHarness internal h;
     MLDSAKeyFactory internal factory;
+
     /// One parameter set's differential vectors and geometry.
     struct Fx {
         ParamSet set;
@@ -1142,7 +1143,9 @@ contract MLDSATest is Test {
         assertEq(a, factory.aPartAddress(set, pkHash, 0), "addressesOf's A is part 0");
         assertEq(t.code, abi.encodePacked(bytes1(0), _slice(blob, 0, 64), _slice(blob, 64 + aLen, f.p.tHatBytes)));
         assertEq(factory.load(set, pkHash), blob);
-        assertEq(factory.load(set, pkHash), vm.parseJsonBytes(_diff(), string.concat(f.key, ".blob1")), "vs dilithium-py");
+        assertEq(
+            factory.load(set, pkHash), vm.parseJsonBytes(_diff(), string.concat(f.key, ".blob1")), "vs dilithium-py"
+        );
         assertTrue(factory.isRegistered(set, pkHash));
         assertTrue(factory.verify(set, pkHash, f.msg[1], f.sig[1]));
         assertTrue(h.verifyByHash(address(factory), set, pkHash, f.msg[1], f.sig[1]));

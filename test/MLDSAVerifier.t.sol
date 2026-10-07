@@ -154,6 +154,7 @@ contract MLDSAVerifierTest is Test {
     MLDSAKeyFactory internal factory; //   keys get registered here
     MLDSAVerifier internal fast; //        reads `factory`
     MLDSAVerifier internal slow; //        reads an empty factory: always the fallback
+
     function setUp() public {
         h = new MLDSAHarness();
         factory = new MLDSAKeyFactory();
@@ -747,6 +748,19 @@ contract MLDSAVerifierTest is Test {
         assertEq(a.code, viaRegister);
         factory.registerA(set, pk); // no-op now
         assertEq(a.code, viaRegister);
+        // The part functions are the plain ones for a single-part set: same code,
+        // same address, in a fresh factory.
+        if (p.aParts == 1) {
+            MLDSAKeyFactory g = new MLDSAKeyFactory();
+            address ga = g.registerAPart(set, pk, 0);
+            assertEq(ga.code, viaRegister, "registerAPart(set, pk, 0) = registerA");
+            MLDSAKeyFactory g2 = new MLDSAKeyFactory();
+            g2.commitA(set, pk);
+            assertEq(g2.aPartCommitment(set, pkHash, 0), keccak256(aHat));
+            address ga2 = g2.storeAPart(set, pkHash, 0, aHat);
+            assertEq(ga2, g2.aPartAddress(set, pkHash, 0));
+            assertEq(ga2.code, viaRegister, "storeAPart(set, pkHash, 0, A) = storeA");
+        }
 
         // With T: fast path; identical verdicts to the fallback.
         factory.registerT(set, pk);
@@ -772,7 +786,8 @@ contract MLDSAVerifierTest is Test {
         bytes memory aHat = _slice(blob, 64, 43008);
         bytes[2] memory part = [_slice(aHat, 0, 21504), _slice(aHat, 21504, 21504)];
         bytes memory foreign1 = _slice(h.precompute(ML_DSA_87, pks[2]), 64 + 21504, 21504);
-        address[2] memory addr = [factory.aPartAddress(ML_DSA_87, pkHash, 0), factory.aPartAddress(ML_DSA_87, pkHash, 1)];
+        address[2] memory addr =
+            [factory.aPartAddress(ML_DSA_87, pkHash, 0), factory.aPartAddress(ML_DSA_87, pkHash, 1)];
 
         vm.expectRevert(MLDSAKeyFactory.NotCommitted.selector);
         factory.storeAPart(ML_DSA_87, pkHash, 0, part[0]);

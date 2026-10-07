@@ -74,11 +74,7 @@ library MLDSAKeys {
     }
 
     /// @notice The address of A part `part` of a key under `factory`.
-    function aPartAddress(address factory, ParamSet set, bytes32 pkHash, uint256 part)
-        internal
-        pure
-        returns (address)
-    {
+    function aPartAddress(address factory, ParamSet set, bytes32 pkHash, uint256 part) internal pure returns (address) {
         return _create2Address(factory, saltAPart(set, pkHash, part));
     }
 
@@ -125,8 +121,7 @@ library MLDSAKeys {
     function isRegistered(address factory, ParamSet set, bytes32 pkHash) internal view returns (bool) {
         (, uint256 tSize) = codeSizes(set);
         if (tSize == 0) return false;
-        return _create2Address(factory, saltT(set, pkHash)).code.length == tSize
-            && isAStored(factory, set, pkHash);
+        return _create2Address(factory, saltT(set, pkHash)).code.length == tSize && isAStored(factory, set, pkHash);
     }
 
     /// @notice Makes sure the Â data contract(s) of (set, pkHash) exist, deploying

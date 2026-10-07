@@ -124,9 +124,7 @@ library MLDSA {
 
     /// @notice FIPS 204 signature length of `set`; 0 for an unknown set.
     function signatureBytes(ParamSet set) internal pure returns (uint256) {
-        return set == ML_DSA_44
-            ? SIG_BYTES_44
-            : set == ML_DSA_65 ? SIG_BYTES_65 : set == ML_DSA_87 ? SIG_BYTES_87 : 0;
+        return set == ML_DSA_44 ? SIG_BYTES_44 : set == ML_DSA_65 ? SIG_BYTES_65 : set == ML_DSA_87 ? SIG_BYTES_87 : 0;
     }
 
     /// @dev SHAKE rates in bytes (FIPS 202; the SHAKE domain/pad byte 0x1F is in `absorb`).
