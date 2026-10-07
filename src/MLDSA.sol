@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-only
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
 import {ParamSet, ML_DSA_44, ML_DSA_65} from "./IMLDSAVerifier.sol";

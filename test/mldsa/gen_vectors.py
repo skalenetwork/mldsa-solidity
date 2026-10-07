@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixture generator for contracts/test/MLDSA.t.sol and MLDSAVerifier.t.sol.
+"""Fixture generator for test/MLDSA.t.sol and MLDSAVerifier.t.sol.
 
 Writes three JSON files next to this script. differential.json and acvp.json
 hold one object per parameter set, under the keys "mldsa44" and "mldsa65":
