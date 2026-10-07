@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {console} from "forge-std/console.sol";
 
-import {ParamSet, ML_DSA_44, ML_DSA_65} from "../src/IMLDSAVerifier.sol";
+import {ParamSet, ML_DSA_44, ML_DSA_65, ML_DSA_87} from "../src/IMLDSAVerifier.sol";
 import {MLDSA} from "../src/MLDSA.sol";
 import {MLDSAKeyFactory, MLDSAKeys} from "../src/MLDSAKeyFactory.sol";
 
@@ -40,6 +40,10 @@ contract MLDSAHarness {
 
     function precompute(ParamSet set, bytes calldata pk) external pure returns (bytes memory) {
         return MLDSA.precompute(set, pk);
+    }
+
+    function precomputeAPart(ParamSet set, bytes calldata pk, uint256 part) external pure returns (bytes memory) {
+        return MLDSA.precomputeAPart(set, pk, part);
     }
 
     function verifyPrecomputedWithContext(
@@ -334,18 +338,16 @@ contract SquatterCreate2 {
     }
 }
 
-/// Every test that concerns the scheme runs for BOTH parameter sets (the `_44` /
-/// `_65` pairs share one body); fixtures live under ".mldsa44" / ".mldsa65".
+/// Every test that concerns the scheme runs for EVERY parameter set (the `_44` /
+/// `_65` / `_87` variants share one body); fixtures live under ".mldsa44" /
+/// ".mldsa65" / ".mldsa87".
 contract MLDSATest is Test {
     MLDSAHarness internal h;
     MLDSAKeyFactory internal factory;
-    string internal diff;
-    string internal acvp;
-
     /// One parameter set's differential vectors and geometry.
     struct Fx {
         ParamSet set;
-        string key; //          ".mldsa44" / ".mldsa65"
+        string key; //          ".mldsa44" / ".mldsa65" / ".mldsa87"
         MLDSA.Params p;
         uint256 y; //           σ offset of the hint encoding: |c̃| + ℓ·zPolyBytes
         bytes[] pk;
@@ -357,23 +359,36 @@ contract MLDSATest is Test {
     function setUp() public {
         h = new MLDSAHarness();
         factory = new MLDSAKeyFactory();
-        diff = vm.readFile("test/mldsa/differential.json");
-        acvp = vm.readFile("test/mldsa/acvp.json");
+    }
+
+    /// Fixtures are read from disk on use, not kept in storage: with ML-DSA-87 they
+    /// are ~1.5 MB, and SSTOREing that in setUp exceeds the per-call gas limit.
+    function _diff() internal view returns (string memory) {
+        return vm.readFile("test/mldsa/differential.json");
+    }
+
+    function _acvp() internal view returns (string memory) {
+        return vm.readFile("test/mldsa/acvp.json");
     }
 
     function _fx(ParamSet set) internal view returns (Fx memory f) {
         f.set = set;
-        f.key = set == ML_DSA_44 ? ".mldsa44" : ".mldsa65";
+        f.key = _jsonKey(set);
         (, f.p) = MLDSA.params(set);
         f.y = f.p.cTildeBytes + f.p.l * f.p.zPolyBytes;
-        f.pk = vm.parseJsonBytesArray(diff, string.concat(f.key, ".pk"));
-        f.msg = vm.parseJsonBytesArray(diff, string.concat(f.key, ".msg"));
-        f.ctx = vm.parseJsonBytesArray(diff, string.concat(f.key, ".ctx"));
-        f.sig = vm.parseJsonBytesArray(diff, string.concat(f.key, ".sig"));
+        string memory js = _diff();
+        f.pk = vm.parseJsonBytesArray(js, string.concat(f.key, ".pk"));
+        f.msg = vm.parseJsonBytesArray(js, string.concat(f.key, ".msg"));
+        f.ctx = vm.parseJsonBytesArray(js, string.concat(f.key, ".ctx"));
+        f.sig = vm.parseJsonBytesArray(js, string.concat(f.key, ".sig"));
+    }
+
+    function _jsonKey(ParamSet set) internal pure returns (string memory) {
+        return set == ML_DSA_44 ? ".mldsa44" : set == ML_DSA_65 ? ".mldsa65" : ".mldsa87";
     }
 
     function _name(ParamSet set) internal pure returns (string memory) {
-        return set == ML_DSA_44 ? "ML-DSA-44" : "ML-DSA-65";
+        return set == ML_DSA_44 ? "ML-DSA-44" : set == ML_DSA_65 ? "ML-DSA-65" : "ML-DSA-87";
     }
 
     // ── Parameters ───────────────────────────────────────────────────────────
@@ -381,10 +396,11 @@ contract MLDSATest is Test {
     /// The geometry the code derives from (k, ℓ, τ, ω, |c̃|, …) against FIPS 204's
     /// sizes: |pk| = 32 + 320k, |σ| = |c̃| + ℓ·zPolyBytes + ω + k.
     function test_params() public pure {
-        ParamSet[2] memory sets = [ML_DSA_44, ML_DSA_65];
-        uint256[2] memory pkLen = [uint256(1312), 1952];
-        uint256[2] memory sigLen = [uint256(2420), 3309];
-        for (uint256 n; n < 2; ++n) {
+        ParamSet[3] memory sets = [ML_DSA_44, ML_DSA_65, ML_DSA_87];
+        uint256[3] memory pkLen = [uint256(1312), 1952, 2592];
+        uint256[3] memory sigLen = [uint256(2420), 3309, 4627];
+        uint256[3] memory parts = [uint256(1), 1, 2];
+        for (uint256 n; n < 3; ++n) {
             (bool ok, MLDSA.Params memory p) = MLDSA.params(sets[n]);
             assertTrue(ok);
             assertEq(p.pkBytes, pkLen[n]);
@@ -395,11 +411,34 @@ contract MLDSATest is Test {
             assertEq(p.tHatBytes, p.k * 768);
             assertEq(MLDSA.publicKeyBytes(sets[n]), pkLen[n]);
             assertEq(MLDSA.signatureBytes(sets[n]), sigLen[n]);
+            assertTrue(MLDSA.supported(sets[n]));
+            assertEq(p.aParts, parts[n]);
+            assertEq(MLDSAKeys.aPartCount(sets[n]), parts[n]);
+            // Every A part fits EIP-170 as 0x00 ‖ part, and a part is whole 4-way
+            // ExpandA batches (precomputeAPart relies on it).
+            (uint256 aCode, uint256 tCode) = MLDSAKeys.codeSizes(sets[n]);
+            assertEq(aCode, 1 + p.aHatBytes / p.aParts);
+            assertEq(tCode, 1 + 64 + p.tHatBytes);
+            assertLe(aCode, 24576);
+            assertEq(p.k % p.aParts, 0);
+            if (p.aParts > 1) assertEq((p.k * p.l / p.aParts) % 4, 0);
         }
-        (bool ok2,) = MLDSA.params(ParamSet.wrap(3));
-        assertFalse(ok2, "unknown set");
+        // ML-DSA-87 (FIPS 204 Table 1): (k, ℓ) = (8, 7), τ = 60, ω = 75, λ = 256.
+        (, MLDSA.Params memory p87) = MLDSA.params(ML_DSA_87);
+        assertEq(p87.k, 8);
+        assertEq(p87.l, 7);
+        assertEq(p87.tau, 60);
+        assertEq(p87.omega, 75);
+        assertEq(p87.cTildeBytes, 64);
+        assertEq(p87.zPolyBytes, 640); // γ1 = 2^19: 20 bits
+        assertEq(p87.w1PolyBytes, 128); // γ2 = (q − 1)/32: 4 bits
+        assertTrue(p87.w1Nibbles);
+        (bool ok3,) = MLDSA.params(ParamSet.wrap(3));
+        assertFalse(ok3, "unknown set");
         assertFalse(MLDSA.supported(ParamSet.wrap(3)));
         assertEq(MLDSA.publicKeyBytes(ParamSet.wrap(255)), 0);
+        assertEq(MLDSA.signatureBytes(ParamSet.wrap(3)), 0);
+        assertEq(MLDSAKeys.aPartCount(ParamSet.wrap(3)), 0);
     }
 
     // ── Keccak / SHAKE ───────────────────────────────────────────────────────
@@ -433,14 +472,14 @@ contract MLDSATest is Test {
     /// blocks — slot 1 must be cleared) and both c̃ sizes / τ values.
     function test_muAndBall_matchesSeparate() public pure {
         uint256[7] memory lens = [uint256(0), 1, 98, 135, 136, 300, 3000];
-        uint256[2] memory cts = [uint256(32), 48];
-        uint256[2] memory taus = [uint256(39), 49];
+        uint256[3] memory cts = [uint256(32), 48, 64];
+        uint256[3] memory taus = [uint256(39), 49, 60];
         for (uint256 n; n < lens.length; ++n) {
             bytes memory data = new bytes(lens[n]);
             for (uint256 i; i < data.length; ++i) {
                 data[i] = bytes1(uint8(i * 29 + n));
             }
-            for (uint256 s; s < 2; ++s) {
+            for (uint256 s; s < 3; ++s) {
                 bytes memory ct = new bytes(cts[s]);
                 for (uint256 i; i < ct.length; ++i) {
                     ct[i] = bytes1(uint8(i * 7 + n * 3 + s));
@@ -478,13 +517,17 @@ contract MLDSATest is Test {
         _intermediates(ML_DSA_65);
     }
 
+    function test_intermediates_87() public view {
+        _intermediates(ML_DSA_87);
+    }
+
     /// tr, μ, Â[0][0] and w1Encode(w1′) of every vector.
     function _intermediates(ParamSet set) internal view {
         Fx memory f = _fx(set);
-        bytes[] memory trs = vm.parseJsonBytesArray(diff, string.concat(f.key, ".tr"));
-        bytes[] memory mus = vm.parseJsonBytesArray(diff, string.concat(f.key, ".mu"));
-        bytes[] memory a00s = vm.parseJsonBytesArray(diff, string.concat(f.key, ".a00"));
-        bytes[] memory w1s = vm.parseJsonBytesArray(diff, string.concat(f.key, ".w1"));
+        bytes[] memory trs = vm.parseJsonBytesArray(_diff(), string.concat(f.key, ".tr"));
+        bytes[] memory mus = vm.parseJsonBytesArray(_diff(), string.concat(f.key, ".mu"));
+        bytes[] memory a00s = vm.parseJsonBytesArray(_diff(), string.concat(f.key, ".a00"));
+        bytes[] memory w1s = vm.parseJsonBytesArray(_diff(), string.concat(f.key, ".w1"));
         for (uint256 v; v < f.pk.length; ++v) {
             uint256 ks = MLDSA.newKeccakWorkspace();
             (bytes32 a, bytes32 b) = MLDSA.shake256To64(ks, MLDSA._ptr(f.pk[v]), f.pk[v].length);
@@ -512,6 +555,10 @@ contract MLDSATest is Test {
 
     function test_differential_65() public view {
         _differential(ML_DSA_65);
+    }
+
+    function test_differential_87() public view {
+        _differential(ML_DSA_87);
     }
 
     function _differential(ParamSet set) internal view {
@@ -561,11 +608,28 @@ contract MLDSATest is Test {
         console.log("ACVP ML-DSA-65 tgId 10 (internal): expected-fail ok", fail);
     }
 
+    function test_acvp_87_external_pure() public view {
+        (uint256 pass, uint256 fail) = _runAcvp(ML_DSA_87, ".mldsa87.external", true);
+        console.log("ACVP ML-DSA-87 tgId 5 (external, pure): expected-pass ok", pass);
+        console.log("ACVP ML-DSA-87 tgId 5 (external, pure): expected-fail ok", fail);
+        assertEq(pass, 3);
+        assertEq(fail, 12);
+    }
+
+    function test_acvp_87_internal() public view {
+        (uint256 pass, uint256 fail) = _runAcvp(ML_DSA_87, ".mldsa87.internal", false);
+        console.log("ACVP ML-DSA-87 tgId 12 (internal): expected-pass ok", pass);
+        console.log("ACVP ML-DSA-87 tgId 12 (internal): expected-fail ok", fail);
+        assertEq(pass, 3);
+        assertEq(fail, 12);
+    }
+
     function _runAcvp(ParamSet set, string memory g, bool external_)
         internal
         view
         returns (uint256 pass, uint256 fail)
     {
+        string memory acvp = _acvp();
         uint256[] memory ids = vm.parseJsonUintArray(acvp, string.concat(g, ".tcId"));
         bytes[] memory pk = vm.parseJsonBytesArray(acvp, string.concat(g, ".pk"));
         bytes[] memory m = vm.parseJsonBytesArray(acvp, string.concat(g, ".msg"));
@@ -600,6 +664,10 @@ contract MLDSATest is Test {
         _rejectBitFlips(ML_DSA_65);
     }
 
+    function test_reject_bitFlips_87() public view {
+        _rejectBitFlips(ML_DSA_87);
+    }
+
     function _rejectBitFlips(ParamSet set) internal view {
         Fx memory f = _fx(set);
         (bytes memory pk, bytes memory m, bytes memory sig) = (f.pk[1], f.msg[1], f.sig[1]);
@@ -630,6 +698,10 @@ contract MLDSATest is Test {
         _rejectWrongLengths(ML_DSA_65);
     }
 
+    function test_reject_wrongLengths_87() public view {
+        _rejectWrongLengths(ML_DSA_87);
+    }
+
     function _rejectWrongLengths(ParamSet set) internal view {
         Fx memory f = _fx(set);
         (bytes memory pk, bytes memory m, bytes memory sig) = (f.pk[1], f.msg[1], f.sig[1]);
@@ -653,6 +725,10 @@ contract MLDSATest is Test {
 
     function test_reject_malformedHints_65() public view {
         _rejectMalformedHints(ML_DSA_65);
+    }
+
+    function test_reject_malformedHints_87() public view {
+        _rejectMalformedHints(ML_DSA_87);
     }
 
     function _rejectMalformedHints(ParamSet set) internal view {
@@ -694,12 +770,12 @@ contract MLDSATest is Test {
 
         // Repeated index (decodes to the SAME h as the valid signature): FIPS 204
         // rejects it; dilithium-py accepts it (fixture records that).
-        bytes memory dup = vm.parseJsonBytes(diff, string.concat(f.key, ".malformed.duplicate"));
+        bytes memory dup = vm.parseJsonBytes(_diff(), string.concat(f.key, ".malformed.duplicate"));
         // Informational only (a property of the reference, not of this verifier):
         console.log(
             _name(set),
             "dilithium-py accepts it:",
-            vm.parseJsonBool(diff, string.concat(f.key, ".malformed.dilithiumPyAccepts"))
+            vm.parseJsonBool(_diff(), string.concat(f.key, ".malformed.dilithiumPyAccepts"))
         );
         assertFalse(h.verify(set, pk, m, dup), "repeated hint index");
         assertFalse(h.verifyPrecomputed(set, h.precompute(set, pk), m, dup), "repeated hint index, precomputed");
@@ -741,6 +817,48 @@ contract MLDSATest is Test {
             _putPair(sig, 48, raws[n], 1000);
             uint256 out = MLDSA._allocWords(5 * 256);
             assertEq(MLDSA.decodeZ(p, sig, out), want[n], vm.toString(raws[n]));
+        }
+    }
+
+    /// ML-DSA-87: γ1 = 2^19 (as 65) but β = 120 → 120 < r < 1048456; z starts at
+    /// σ[64] (|c̃| = 64) and spans ℓ = 7 polynomials. Both positions of a 5-byte
+    /// pair, in the first and in the last pair of z.
+    function test_zNormBoundary_87() public pure {
+        (, MLDSA.Params memory p) = MLDSA.params(ML_DSA_87);
+        uint256[6] memory raws = [uint256(120), 121, 1048455, 1048456, 196, 1048380];
+        bool[6] memory want = [false, true, true, false, true, true]; // 65's bounds are inside 87's
+        uint256[2] memory pairs = [uint256(0), 7 * 128 - 1];
+        for (uint256 n; n < raws.length; ++n) {
+            for (uint256 at; at < 2; ++at) {
+                for (uint256 pos; pos < 2; ++pos) {
+                    bytes memory sig = new bytes(4627);
+                    for (uint256 c; c < 7 * 256; c += 2) {
+                        _putPair(sig, 64 + (c / 2) * 5, 1000, 1000);
+                    }
+                    if (pos == 0) _putPair(sig, 64 + pairs[at] * 5, raws[n], 1000);
+                    else _putPair(sig, 64 + pairs[at] * 5, 1000, raws[n]);
+                    uint256 out = MLDSA._allocWords(7 * 256 + 8);
+                    assertEq(MLDSA.decodeZ(p, sig, out), want[n], vm.toString(raws[n]));
+                }
+            }
+        }
+        // The planted value lands where it should: residue q + γ1 − r.
+        bytes memory s2 = new bytes(4627);
+        for (uint256 c; c < 7 * 256; c += 2) {
+            _putPair(s2, 64 + (c / 2) * 5, 121 + c, 1048455 - c);
+        }
+        uint256 o2 = MLDSA._allocWords(7 * 256 + 8);
+        assertTrue(MLDSA.decodeZ(p, s2, o2));
+        for (uint256 c; c < 7 * 256; c += 2) {
+            uint256 g0;
+            uint256 g1;
+            uint256 at0 = o2 + c * 32;
+            assembly ("memory-safe") {
+                g0 := mload(at0)
+                g1 := mload(add(at0, 0x20))
+            }
+            assertEq(g0, 8904705 - (121 + c));
+            assertEq(g1, 8904705 - (1048455 - c));
         }
     }
 
@@ -791,6 +909,22 @@ contract MLDSATest is Test {
         assertFalse(h.verify(ML_DSA_65, pk, m, s));
     }
 
+    function test_reject_zOutOfRange_87() public view {
+        Fx memory f = _fx(ML_DSA_87);
+        (bytes memory pk, bytes memory m, bytes memory sig) = (f.pk[1], f.msg[1], f.sig[1]);
+        assertTrue(h.verify(ML_DSA_87, pk, m, sig));
+        bytes memory s = _copy(sig);
+        _putPair(s, 64, 120, 1000); // |z_0| = γ1 − β exactly
+        assertFalse(h.verify(ML_DSA_87, pk, m, s), "|z| = gamma1 - beta");
+        s = _copy(sig);
+        _putPair(s, 64 + 5 * 895, 1000, 1048456); // last pair, z = −(γ1 − β)
+        assertFalse(h.verify(ML_DSA_87, pk, m, s), "z = -(gamma1 - beta), last coefficient");
+        s = _copy(sig);
+        _putPair(s, 64 + 5 * 300, 1000, 0xFFFFF); // z = γ1 − (2^20 − 1)
+        assertFalse(h.verify(ML_DSA_87, pk, m, s));
+        assertFalse(h.verifyPrecomputed(ML_DSA_87, h.precompute(ML_DSA_87, pk), m, s), "precomputed");
+    }
+
     /// forge-config: default.fuzz.runs = 48
     function testFuzz_reject_corruptedSignature_44(uint16 pos, uint8 delta) public view {
         _corruptedSignature(ML_DSA_44, pos, delta);
@@ -799,6 +933,11 @@ contract MLDSATest is Test {
     /// forge-config: default.fuzz.runs = 48
     function testFuzz_reject_corruptedSignature_65(uint16 pos, uint8 delta) public view {
         _corruptedSignature(ML_DSA_65, pos, delta);
+    }
+
+    /// forge-config: default.fuzz.runs = 32
+    function testFuzz_reject_corruptedSignature_87(uint16 pos, uint8 delta) public view {
+        _corruptedSignature(ML_DSA_87, pos, delta);
     }
 
     function _corruptedSignature(ParamSet set, uint16 pos, uint8 delta) internal view {
@@ -818,6 +957,11 @@ contract MLDSATest is Test {
     /// forge-config: default.fuzz.runs = 48
     function testFuzz_reject_corruptedHints_65(uint8 pos, uint8 value) public view {
         _corruptedHints(ML_DSA_65, pos, value);
+    }
+
+    /// forge-config: default.fuzz.runs = 32
+    function testFuzz_reject_corruptedHints_87(uint8 pos, uint8 value) public view {
+        _corruptedHints(ML_DSA_87, pos, value);
     }
 
     function _corruptedHints(ParamSet set, uint8 pos, uint8 value) internal view {
@@ -861,6 +1005,54 @@ contract MLDSATest is Test {
         assertFalse(h.verifyPrecomputed(ML_DSA_44, blobB, b.msg[1], b.sig[1]), "65 blob under 44");
     }
 
+    /// ML-DSA-87 against both other sets: every (key set, signature set, claimed
+    /// set) combination but the matching one is false, as are 87 material cut or
+    /// padded to another set's length and blobs under the wrong set.
+    function test_crossSet_87() public view {
+        Fx[3] memory fx = [_fx(ML_DSA_44), _fx(ML_DSA_65), _fx(ML_DSA_87)];
+        uint256 checked;
+        for (uint256 ks; ks < 3; ++ks) {
+            for (uint256 ss; ss < 3; ++ss) {
+                for (uint256 cs; cs < 3; ++cs) {
+                    if (ks != 2 && ss != 2 && cs != 2) continue; // 44/65-only: test_crossSet
+                    bool want = ks == ss && ss == cs;
+                    assertEq(
+                        h.verify(fx[cs].set, fx[ks].pk[1], fx[ss].msg[1], fx[ss].sig[1]),
+                        want,
+                        string.concat("key ", vm.toString(ks), " sig ", vm.toString(ss), " set ", vm.toString(cs))
+                    );
+                    ++checked;
+                }
+            }
+        }
+        assertEq(checked, 19);
+        Fx memory e = fx[2];
+        // An 87 signature cut to 65's / 44's length, and 65 / 44 signatures padded to 87's.
+        assertFalse(h.verify(ML_DSA_65, fx[1].pk[1], e.msg[1], _trim(e.sig[1], 4627 - 3309)), "87 sig trimmed to 65");
+        assertFalse(h.verify(ML_DSA_44, fx[0].pk[1], e.msg[1], _trim(e.sig[1], 4627 - 2420)), "87 sig trimmed to 44");
+        assertFalse(
+            h.verify(ML_DSA_87, e.pk[1], fx[1].msg[1], abi.encodePacked(fx[1].sig[1], new bytes(4627 - 3309))),
+            "65 sig padded"
+        );
+        assertFalse(
+            h.verify(ML_DSA_87, e.pk[1], fx[0].msg[1], abi.encodePacked(fx[0].sig[1], new bytes(4627 - 2420))),
+            "44 sig padded"
+        );
+        // An 87 key's first 1952 / 1312 bytes (same ρ) under 65 / 44 with 87's signature.
+        assertFalse(h.verify(ML_DSA_65, _trim(e.pk[1], 2592 - 1952), e.msg[1], _trim(e.sig[1], 4627 - 3309)));
+        assertFalse(h.verify(ML_DSA_44, _trim(e.pk[1], 2592 - 1312), e.msg[1], _trim(e.sig[1], 4627 - 2420)));
+        // Precomputation is per set.
+        assertEq(h.precompute(ML_DSA_87, fx[1].pk[1]).length, 0);
+        assertEq(h.precompute(ML_DSA_65, e.pk[1]).length, 0);
+        bytes memory blob87 = h.precompute(ML_DSA_87, e.pk[1]);
+        assertTrue(h.verifyPrecomputed(ML_DSA_87, blob87, e.msg[1], e.sig[1]));
+        assertFalse(h.verifyPrecomputed(ML_DSA_65, blob87, e.msg[1], e.sig[1]), "87 blob under 65");
+        assertFalse(h.verifyPrecomputed(ML_DSA_44, blob87, e.msg[1], e.sig[1]), "87 blob under 44");
+        assertFalse(h.verifyPrecomputed(ML_DSA_87, h.precompute(ML_DSA_65, fx[1].pk[1]), e.msg[1], e.sig[1]), "65 blob");
+        // Unknown id 3 with valid 87 material.
+        assertFalse(h.verify(ParamSet.wrap(3), e.pk[1], e.msg[1], e.sig[1]), "id 3");
+    }
+
     // ── Precomputation (verifyPrecomputed, MLDSAKeyFactory) ──────────────────
 
     /// precompute(pk) byte-for-byte against dilithium-py's tr, Â and NTT(t1·2^d).
@@ -872,12 +1064,23 @@ contract MLDSATest is Test {
         _precomputeMatches(ML_DSA_65, 27712);
     }
 
+    function test_precompute_matchesReference_87() public view {
+        _precomputeMatches(ML_DSA_87, 49216);
+    }
+
     function _precomputeMatches(ParamSet set, uint256 len) internal view {
         Fx memory f = _fx(set);
         bytes memory blob = h.precompute(set, f.pk[1]);
         assertEq(blob.length, len);
-        assertEq(blob, vm.parseJsonBytes(diff, string.concat(f.key, ".blob1")));
+        assertEq(blob, vm.parseJsonBytes(_diff(), string.concat(f.key, ".blob1")));
         assertEq(h.precompute(set, _trim(f.pk[1], 1)).length, 0, "bad pk -> empty");
+        // Â part by part is Â cut into aParts equal pieces; no part beyond.
+        uint256 partBytes = f.p.aHatBytes / f.p.aParts;
+        for (uint256 part; part < f.p.aParts; ++part) {
+            assertEq(h.precomputeAPart(set, f.pk[1], part), _slice(blob, 64 + part * partBytes, partBytes), "A part");
+        }
+        assertEq(h.precomputeAPart(set, f.pk[1], f.p.aParts).length, 0, "no such part");
+        assertEq(h.precomputeAPart(set, _trim(f.pk[1], 1), 0).length, 0, "bad pk -> empty part");
     }
 
     function test_precomputed_rejects_44() public view {
@@ -886,6 +1089,10 @@ contract MLDSATest is Test {
 
     function test_precomputed_rejects_65() public view {
         _precomputedRejects(ML_DSA_65);
+    }
+
+    function test_precomputed_rejects_87() public view {
+        _precomputedRejects(ML_DSA_87);
     }
 
     function _precomputedRejects(ParamSet set) internal view {
@@ -913,6 +1120,10 @@ contract MLDSATest is Test {
         _factoryContents(ML_DSA_65);
     }
 
+    function test_factory_contentsMatchPrecompute_87() public {
+        _factoryContents(ML_DSA_87);
+    }
+
     function _factoryContents(ParamSet set) internal {
         Fx memory f = _fx(set);
         bytes32 pkHash = keccak256(f.pk[1]);
@@ -921,11 +1132,17 @@ contract MLDSATest is Test {
         assertEq(t, factory.registerT(set, f.pk[1]));
         bytes memory blob = h.precompute(set, f.pk[1]);
         uint256 aLen = f.p.aHatBytes;
-        // Byte for byte: 0x00 ‖ Â and 0x00 ‖ tr ‖ t̂.
-        assertEq(a.code, abi.encodePacked(bytes1(0), _slice(blob, 64, aLen)));
+        // Byte for byte: 0x00 ‖ Â (per part) and 0x00 ‖ tr ‖ t̂.
+        uint256 partLen = aLen / f.p.aParts;
+        for (uint256 part; part < f.p.aParts; ++part) {
+            address ap = factory.aPartAddress(set, pkHash, part);
+            assertEq(ap.code, abi.encodePacked(bytes1(0), _slice(blob, 64 + part * partLen, partLen)), "A part code");
+            assertLe(ap.code.length, 24576, "EIP-170");
+        }
+        assertEq(a, factory.aPartAddress(set, pkHash, 0), "addressesOf's A is part 0");
         assertEq(t.code, abi.encodePacked(bytes1(0), _slice(blob, 0, 64), _slice(blob, 64 + aLen, f.p.tHatBytes)));
         assertEq(factory.load(set, pkHash), blob);
-        assertEq(factory.load(set, pkHash), vm.parseJsonBytes(diff, string.concat(f.key, ".blob1")), "vs dilithium-py");
+        assertEq(factory.load(set, pkHash), vm.parseJsonBytes(_diff(), string.concat(f.key, ".blob1")), "vs dilithium-py");
         assertTrue(factory.isRegistered(set, pkHash));
         assertTrue(factory.verify(set, pkHash, f.msg[1], f.sig[1]));
         assertTrue(h.verifyByHash(address(factory), set, pkHash, f.msg[1], f.sig[1]));
@@ -943,6 +1160,10 @@ contract MLDSATest is Test {
 
     function test_factory_allVectors_65() public {
         _factoryAllVectors(ML_DSA_65);
+    }
+
+    function test_factory_allVectors_87() public {
+        _factoryAllVectors(ML_DSA_87);
     }
 
     function _factoryAllVectors(ParamSet set) internal {
@@ -964,6 +1185,10 @@ contract MLDSATest is Test {
         _factoryUnregisteredAndForeign(ML_DSA_65);
     }
 
+    function test_factory_unregisteredAndForeign_87() public {
+        _factoryUnregisteredAndForeign(ML_DSA_87);
+    }
+
     function _factoryUnregisteredAndForeign(ParamSet set) internal {
         Fx memory f = _fx(set);
         bytes32 h1 = keccak256(f.pk[1]);
@@ -972,9 +1197,18 @@ contract MLDSATest is Test {
         assertEq(factory.load(set, h1).length, 0);
         assertFalse(factory.verify(set, h1, f.msg[1], f.sig[1]), "unregistered");
         // Half registered: still false.
+        if (f.p.aParts > 1) {
+            factory.registerAPart(set, f.pk[1], 1);
+            factory.registerT(set, f.pk[1]);
+            assertFalse(factory.isRegistered(set, h1));
+            assertEq(factory.load(set, h1).length, 0);
+            assertFalse(factory.verify(set, h1, f.msg[1], f.sig[1]), "A part 1 + T only");
+        }
         factory.registerA(set, f.pk[1]);
-        assertFalse(factory.isRegistered(set, h1));
-        assertFalse(factory.verify(set, h1, f.msg[1], f.sig[1]), "only A registered");
+        if (f.p.aParts == 1) {
+            assertFalse(factory.isRegistered(set, h1));
+            assertFalse(factory.verify(set, h1, f.msg[1], f.sig[1]), "only A registered");
+        }
         factory.registerT(set, f.pk[1]);
         assertTrue(factory.verify(set, h1, f.msg[1], f.sig[1]));
         // pkHash of key X with key Y's valid signature (seed 2 vs seed 1).
@@ -988,9 +1222,15 @@ contract MLDSATest is Test {
         factory.registerA(set, _trim(f.pk[1], 1));
         vm.expectRevert(MLDSAKeyFactory.InvalidPublicKey.selector);
         factory.registerT(set, abi.encodePacked(f.pk[1], bytes1(0)));
+        vm.expectRevert(MLDSAKeyFactory.InvalidPublicKey.selector);
+        factory.registerAPart(set, _trim(f.pk[1], 1), 0);
+        vm.expectRevert(MLDSAKeyFactory.InvalidPart.selector);
+        factory.registerAPart(set, f.pk[1], f.p.aParts);
         // Unknown set: registration reverts, everything else is a plain "no".
         vm.expectRevert(MLDSAKeyFactory.UnsupportedParamSet.selector);
         factory.registerA(ParamSet.wrap(3), f.pk[1]);
+        vm.expectRevert(MLDSAKeyFactory.UnsupportedParamSet.selector);
+        factory.registerAPart(ParamSet.wrap(3), f.pk[1], 0);
         vm.expectRevert(MLDSAKeyFactory.UnsupportedParamSet.selector);
         factory.registerT(ParamSet.wrap(3), f.pk[1]);
         assertFalse(factory.isRegistered(ParamSet.wrap(3), h1));
@@ -1031,6 +1271,73 @@ contract MLDSATest is Test {
         // Each set's registered key against the other set's signature.
         assertFalse(factory.verify(ML_DSA_44, ha, b.msg[1], b.sig[1]), "65 sig vs registered 44 key");
         assertFalse(factory.verify(ML_DSA_65, hb, a.msg[1], a.sig[1]), "44 sig vs registered 65 key");
+    }
+
+    /// The 87 key under 44 / 65 and their keys under 87: registration refused
+    /// (wrong length), and a key registered under one set is never found under
+    /// another — distinct addresses for every (set, role, part).
+    function test_factory_crossSet_87() public {
+        Fx memory a = _fx(ML_DSA_44);
+        Fx memory b = _fx(ML_DSA_65);
+        Fx memory e = _fx(ML_DSA_87);
+        bytes32 he = keccak256(e.pk[1]);
+        vm.expectRevert(MLDSAKeyFactory.InvalidPublicKey.selector);
+        factory.registerAPart(ML_DSA_87, b.pk[1], 0);
+        vm.expectRevert(MLDSAKeyFactory.InvalidPublicKey.selector);
+        factory.registerT(ML_DSA_87, a.pk[1]);
+        vm.expectRevert(MLDSAKeyFactory.InvalidPublicKey.selector);
+        factory.registerA(ML_DSA_65, e.pk[1]);
+        vm.expectRevert(MLDSAKeyFactory.InvalidPublicKey.selector);
+        factory.registerT(ML_DSA_44, e.pk[1]);
+        factory.registerA(ML_DSA_87, e.pk[1]);
+        factory.registerT(ML_DSA_87, e.pk[1]);
+        factory.registerA(ML_DSA_65, b.pk[1]);
+        factory.registerT(ML_DSA_65, b.pk[1]);
+        assertTrue(factory.verify(ML_DSA_87, he, e.msg[1], e.sig[1]));
+        // Seven distinct addresses for one pkHash: A, T under 44 and 65; A0, A1, T under 87.
+        address[7] memory xs;
+        (xs[0], xs[1]) = factory.addressesOf(ML_DSA_44, he);
+        (xs[2], xs[3]) = factory.addressesOf(ML_DSA_65, he);
+        (xs[4], xs[6]) = factory.addressesOf(ML_DSA_87, he);
+        xs[5] = factory.aPartAddress(ML_DSA_87, he, 1);
+        assertEq(xs[4], factory.aPartAddress(ML_DSA_87, he, 0));
+        for (uint256 i; i < 7; ++i) {
+            for (uint256 j = i + 1; j < 7; ++j) {
+                assertTrue(xs[i] != xs[j], "distinct addresses");
+            }
+        }
+        assertFalse(factory.isRegistered(ML_DSA_65, he));
+        assertFalse(factory.verify(ML_DSA_65, he, e.msg[1], e.sig[1]), "87 key hash under 65");
+        assertFalse(factory.verify(ML_DSA_44, he, e.msg[1], e.sig[1]), "87 key hash under 44");
+        assertFalse(factory.isRegistered(ML_DSA_87, keccak256(b.pk[1])));
+        assertFalse(factory.verify(ML_DSA_87, keccak256(b.pk[1]), b.msg[1], b.sig[1]), "65 key hash under 87");
+        assertFalse(factory.verify(ML_DSA_87, he, b.msg[1], b.sig[1]), "65 sig vs registered 87 key");
+        assertFalse(factory.verify(ML_DSA_65, keccak256(b.pk[1]), e.msg[1], e.sig[1]), "87 sig vs registered 65 key");
+    }
+
+    /// Backward compatibility: the 44 / 65 data addresses are exactly what they were
+    /// before parts existed — CREATE2 with keccak256(abi.encode("MLDSA.A_hat", set,
+    /// pkHash)) and the fixed init code — recomputed here by hand.
+    function test_factory_addressesUnchanged_44_65() public view {
+        bytes32 pkHash = keccak256("any key");
+        bytes32 initHash = keccak256(hex"5f5f5f5f335afa156012573d5f5f3e3d5ff35b5f5ffd");
+        for (uint8 id; id < 2; ++id) {
+            bytes32 sa = keccak256(abi.encode("MLDSA.A_hat", id, pkHash));
+            bytes32 st = keccak256(abi.encode("MLDSA.tr_t_hat", id, pkHash));
+            address wantA =
+                address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(factory), sa, initHash)))));
+            address wantT =
+                address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(factory), st, initHash)))));
+            (address a, address t) = factory.addressesOf(ParamSet.wrap(id), pkHash);
+            assertEq(a, wantA);
+            assertEq(t, wantT);
+            assertEq(factory.aPartAddress(ParamSet.wrap(id), pkHash, 0), wantA);
+            assertEq(MLDSAKeys.saltAPart(ParamSet.wrap(id), pkHash, 0), sa);
+        }
+        // 87: the part is in every A salt (none equals the 44/65-style salt).
+        bytes32 s87 = keccak256(abi.encode("MLDSA.A_hat", uint8(2), pkHash));
+        assertTrue(MLDSAKeys.saltAPart(ML_DSA_87, pkHash, 0) != s87);
+        assertEq(MLDSAKeys.saltAPart(ML_DSA_87, pkHash, 1), keccak256(abi.encode("MLDSA.A_hat", uint8(2), pkHash, 1)));
     }
 
     function test_factory_idempotent() public {
@@ -1077,6 +1384,22 @@ contract MLDSATest is Test {
         factory.registerA(ML_DSA_44, f.pk[1]);
         (ok,) = address(factory).call("");
         assertFalse(ok, "fallback after registration");
+
+        // ML-DSA-87: both A parts and T, same story.
+        Fx memory e = _fx(ML_DSA_87);
+        bytes32 he = keccak256(e.pk[1]);
+        for (uint256 part; part < 2; ++part) {
+            address ap = factory.aPartAddress(ML_DSA_87, he, part);
+            assertTrue(squatter.squat(MLDSAKeys.saltAPart(ML_DSA_87, he, part)) != ap);
+            assertTrue(f2.aPartAddress(ML_DSA_87, he, part) != ap);
+            assertTrue(MLDSAKeys.aPartAddress(address(squatter), ML_DSA_87, he, part) != ap);
+            assertEq(ap.code.length, 0);
+        }
+        factory.registerAPart(ML_DSA_87, e.pk[1], 0);
+        assertEq(factory.aPartAddress(ML_DSA_87, he, 0).code.length, 21505);
+        assertEq(factory.aPartAddress(ML_DSA_87, he, 1).code.length, 0, "part 1 untouched");
+        (ok,) = address(factory).call("");
+        assertFalse(ok, "fallback after an 87 part");
     }
 
     // ── Gas ──────────────────────────────────────────────────────────────────
@@ -1087,6 +1410,10 @@ contract MLDSATest is Test {
 
     function test_gas_verify_65() public view {
         _gasVerify(ML_DSA_65);
+    }
+
+    function test_gas_verify_87() public view {
+        _gasVerify(ML_DSA_87);
     }
 
     function _gasVerify(ParamSet set) internal view {
@@ -1109,6 +1436,10 @@ contract MLDSATest is Test {
 
     function test_gas_precomputed_65() public {
         _gasPrecomputed(ML_DSA_65);
+    }
+
+    function test_gas_precomputed_87() public {
+        _gasPrecomputed(ML_DSA_87);
     }
 
     function _gasPrecomputed(ParamSet set) internal {
@@ -1188,6 +1519,10 @@ contract MLDSATest is Test {
         _gasPhases(ML_DSA_65);
     }
 
+    function test_gas_phases_87() public view {
+        _gasPhases(ML_DSA_87);
+    }
+
     function _gasPhases(ParamSet set) internal view {
         Fx memory f = _fx(set);
         bytes memory mPrime = abi.encodePacked(bytes1(0), bytes1(0), f.msg[1]);
@@ -1221,12 +1556,13 @@ contract MLDSATest is Test {
     /// with hashlib, mirroring the sampler's drain-by-group rule):
     ///   ML-DSA-44: 16 streams, 4,128 candidates parsed, 20 permutations
     ///   ML-DSA-65: 30 streams, 7,736 candidates parsed, 40 permutations
+    ///   ML-DSA-87: 56 streams, 14,400 candidates parsed, 70 permutations
     function test_gas_expandA() public view {
         (uint256 perm,,) = h.unitCosts();
-        ParamSet[2] memory sets = [ML_DSA_44, ML_DSA_65];
-        uint256[2] memory cands = [uint256(4128), 7736];
-        uint256[2] memory perms = [uint256(20), 40];
-        for (uint256 n; n < 2; ++n) {
+        ParamSet[3] memory sets = [ML_DSA_44, ML_DSA_65, ML_DSA_87];
+        uint256[3] memory cands = [uint256(4128), 7736, 14400];
+        uint256[3] memory perms = [uint256(20), 40, 70];
+        for (uint256 n; n < 3; ++n) {
             Fx memory f = _fx(sets[n]);
             (uint256 fused, uint256 plain) = h.expandAGas(sets[n], f.pk[1]);
             console.log(_name(sets[n]));
@@ -1325,7 +1661,7 @@ contract MLDSATest is Test {
         }
     }
 
-    /// Writes two 20-bit little-endian fields (one ML-DSA-65 z pair) at byte offset `o`.
+    /// Writes two 20-bit little-endian fields (one ML-DSA-65 / -87 z pair) at byte offset `o`.
     function _putPair(bytes memory s, uint256 o, uint256 r0, uint256 r1) internal pure {
         uint256 v = r0 | (r1 << 20);
         for (uint256 i; i < 5; ++i) {

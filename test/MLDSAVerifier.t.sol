@@ -6,7 +6,7 @@ import {console} from "forge-std/console.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 
-import {IMLDSAVerifier, ParamSet, ML_DSA_44, ML_DSA_65} from "../src/IMLDSAVerifier.sol";
+import {IMLDSAVerifier, ParamSet, ML_DSA_44, ML_DSA_65, ML_DSA_87} from "../src/IMLDSAVerifier.sol";
 import {MLDSA} from "../src/MLDSA.sol";
 import {MLDSAKeyFactory, MLDSAKeys} from "../src/MLDSAKeyFactory.sol";
 import {MLDSAPublicKeys} from "../src/MLDSAPublicKeys.sol";
@@ -154,24 +154,29 @@ contract MLDSAVerifierTest is Test {
     MLDSAKeyFactory internal factory; //   keys get registered here
     MLDSAVerifier internal fast; //        reads `factory`
     MLDSAVerifier internal slow; //        reads an empty factory: always the fallback
-    string internal diff;
-    string internal acvp;
-
     function setUp() public {
         h = new MLDSAHarness();
         factory = new MLDSAKeyFactory();
         fast = new MLDSAVerifier(address(factory));
         slow = new MLDSAVerifier(address(new MLDSAKeyFactory()));
-        diff = vm.readFile("test/mldsa/differential.json");
-        acvp = vm.readFile("test/mldsa/acvp.json");
+    }
+
+    /// Fixtures are read from disk on use, not kept in storage: with ML-DSA-87 they
+    /// are ~1.5 MB, and SSTOREing that in setUp exceeds the per-call gas limit.
+    function _diff() internal view returns (string memory) {
+        return vm.readFile("test/mldsa/differential.json");
+    }
+
+    function _acvp() internal view returns (string memory) {
+        return vm.readFile("test/mldsa/acvp.json");
     }
 
     function _key(ParamSet set) internal pure returns (string memory) {
-        return set == ML_DSA_44 ? ".mldsa44" : ".mldsa65";
+        return set == ML_DSA_44 ? ".mldsa44" : set == ML_DSA_65 ? ".mldsa65" : ".mldsa87";
     }
 
     function _vec(ParamSet set, string memory field) internal view returns (bytes[] memory) {
-        return vm.parseJsonBytesArray(diff, string.concat(_key(set), ".", field));
+        return vm.parseJsonBytesArray(_diff(), string.concat(_key(set), ".", field));
     }
 
     function _register(ParamSet set, bytes memory pk) internal {
@@ -185,7 +190,8 @@ contract MLDSAVerifierTest is Test {
     function test_interface_supportsAndErc165() public {
         assertTrue(fast.supportsParamSet(ML_DSA_44));
         assertTrue(fast.supportsParamSet(ML_DSA_65));
-        assertTrue(fast.supportsParamSet(ParamSet.wrap(2))); // ML-DSA-87
+        assertTrue(fast.supportsParamSet(ML_DSA_87));
+        assertTrue(fast.supportsParamSet(ParamSet.wrap(2)));
         assertFalse(fast.supportsParamSet(ParamSet.wrap(3)));
         assertFalse(fast.supportsParamSet(ParamSet.wrap(255)));
         assertTrue(fast.supportsInterface(type(IMLDSAVerifier).interfaceId));
@@ -217,6 +223,10 @@ contract MLDSAVerifierTest is Test {
         _differential(ML_DSA_65);
     }
 
+    function test_interface_differential_87() public {
+        _differential(ML_DSA_87);
+    }
+
     /// Empty-context vectors must verify; contexted ones (the interface is pure
     /// ML-DSA with ctx = "") must not; and all three paths agree on every input,
     /// including corruptions.
@@ -236,7 +246,7 @@ contract MLDSAVerifierTest is Test {
             _agree(set, pk[v], m[v], bad, false);
             _agree(set, pk[v], abi.encodePacked(m[v], bytes1(0)), sig[v], false);
         }
-        bytes memory dup = vm.parseJsonBytes(diff, string.concat(_key(set), ".malformed.duplicate"));
+        bytes memory dup = vm.parseJsonBytes(_diff(), string.concat(_key(set), ".malformed.duplicate"));
         _agree(set, pk[1], m[1], dup, false); // repeated hint index: FIPS 204 rejects
         console.log("interface: differential vectors verified on both paths:", passed);
     }
@@ -276,12 +286,47 @@ contract MLDSAVerifierTest is Test {
         _acvp(ML_DSA_65, ".mldsa65.internal", false, 8, 99);
     }
 
+    // ML-DSA-87 per key is ~2× 65 (two A parts, a bigger T): quarters.
+
+    function test_interface_acvp_87_external_a() public {
+        _acvp(ML_DSA_87, ".mldsa87.external", true, 0, 4);
+    }
+
+    function test_interface_acvp_87_external_b() public {
+        _acvp(ML_DSA_87, ".mldsa87.external", true, 4, 8);
+    }
+
+    function test_interface_acvp_87_external_c() public {
+        _acvp(ML_DSA_87, ".mldsa87.external", true, 8, 12);
+    }
+
+    function test_interface_acvp_87_external_d() public {
+        _acvp(ML_DSA_87, ".mldsa87.external", true, 12, 99);
+    }
+
+    function test_interface_acvp_87_internal_a() public {
+        _acvp(ML_DSA_87, ".mldsa87.internal", false, 0, 4);
+    }
+
+    function test_interface_acvp_87_internal_b() public {
+        _acvp(ML_DSA_87, ".mldsa87.internal", false, 4, 8);
+    }
+
+    function test_interface_acvp_87_internal_c() public {
+        _acvp(ML_DSA_87, ".mldsa87.internal", false, 8, 12);
+    }
+
+    function test_interface_acvp_87_internal_d() public {
+        _acvp(ML_DSA_87, ".mldsa87.internal", false, 12, 99);
+    }
+
     /// The interface is ML-DSA.Verify with ctx = "": NIST's external vectors carry
     /// contexts (and the internal ones a raw M′), so through the interface each
     /// vector is run as (pk, msg, sig) and the fast path, the fallback and the
     /// library's verify(set, pk, msg, sig) must agree; where NIST's context is
     /// empty, the result must also be NIST's.
     function _acvp(ParamSet set, string memory g, bool external_, uint256 from, uint256 to) internal {
+        string memory acvp = _acvp();
         uint256[] memory ids = vm.parseJsonUintArray(acvp, string.concat(g, ".tcId"));
         bytes[] memory pk = vm.parseJsonBytesArray(acvp, string.concat(g, ".pk"));
         bytes[] memory m = vm.parseJsonBytesArray(acvp, string.concat(g, ".msg"));
@@ -353,6 +398,38 @@ contract MLDSAVerifierTest is Test {
         assertFalse(fast.verify(ML_DSA_44, pk, m4[1], s[1]), "A committed, foreign sig");
     }
 
+    /// ML-DSA-87 through the interface, against 44 and 65, on both paths.
+    function test_interface_wrongSetAndLengths_87() public {
+        ParamSet[3] memory sets = [ML_DSA_44, ML_DSA_65, ML_DSA_87];
+        bytes[3] memory pk;
+        bytes[3] memory m;
+        bytes[3] memory sg;
+        for (uint256 i; i < 3; ++i) {
+            pk[i] = _vec(sets[i], "pk")[1];
+            m[i] = _vec(sets[i], "msg")[1];
+            sg[i] = _vec(sets[i], "sig")[1];
+            _register(sets[i], pk[i]);
+        }
+        IMLDSAVerifier[2] memory vs = [IMLDSAVerifier(fast), IMLDSAVerifier(slow)];
+        for (uint256 x; x < 2; ++x) {
+            for (uint256 ks; ks < 3; ++ks) {
+                for (uint256 ss; ss < 3; ++ss) {
+                    for (uint256 cs; cs < 3; ++cs) {
+                        if (ks != 2 && ss != 2 && cs != 2) continue;
+                        assertEq(vs[x].verify(sets[cs], pk[ks], m[ss], sg[ss]), ks == ss && ss == cs);
+                    }
+                }
+            }
+            assertFalse(vs[x].verify(ParamSet.wrap(3), pk[2], m[2], sg[2]), "unknown set");
+            assertFalse(vs[x].verify(ML_DSA_87, _slice(pk[2], 0, 2591), m[2], sg[2]), "short pk");
+            assertFalse(vs[x].verify(ML_DSA_87, abi.encodePacked(pk[2], bytes1(0)), m[2], sg[2]), "long pk");
+            assertFalse(vs[x].verify(ML_DSA_87, pk[2], m[2], _slice(sg[2], 0, 4626)), "short sig");
+            assertFalse(vs[x].verify(ML_DSA_87, pk[2], m[2], abi.encodePacked(sg[2], bytes1(0))), "long sig");
+            assertFalse(vs[x].verify(ML_DSA_87, "", m[2], sg[2]), "empty pk");
+            assertFalse(vs[x].verify(ML_DSA_87, pk[2], m[2], ""), "empty sig");
+        }
+    }
+
     // ── Callers are implementation-agnostic ──────────────────────────────────
 
     /// The same wallet code runs on MLDSAVerifier and on a mock "precompile
@@ -387,8 +464,8 @@ contract MLDSAVerifierTest is Test {
 
     function test_publicKeys_storeLoad() public {
         PkStoreHarness ps = new PkStoreHarness();
-        ParamSet[2] memory sets = [ML_DSA_44, ML_DSA_65];
-        for (uint256 i; i < 2; ++i) {
+        ParamSet[3] memory sets = [ML_DSA_44, ML_DSA_65, ML_DSA_87];
+        for (uint256 i; i < 3; ++i) {
             bytes[] memory pk = _vec(sets[i], "pk");
             for (uint256 v; v < pk.length; ++v) {
                 address p = ps.store(pk[v]);
@@ -415,13 +492,18 @@ contract MLDSAVerifierTest is Test {
         _lifecycle(ML_DSA_65);
     }
 
+    function test_gas_walletLifecycle_87() public {
+        _lifecycle(ML_DSA_87);
+    }
+
     function _lifecycle(ParamSet set) internal {
-        string memory name = set == ML_DSA_44 ? "ML-DSA-44" : "ML-DSA-65";
+        string memory name = _name(set);
         bytes[] memory pks = _vec(set, "pk");
         bytes[] memory m = _vec(set, "msg");
         bytes[] memory sig = _vec(set, "sig");
         bytes memory pk = pks[1];
         bytes32 pkHash = keccak256(pk);
+        if (set == ML_DSA_87) _lifecycleParts87(pk, pkHash);
         bytes memory aHat = h.precompute(set, pk); // tr ‖ Â ‖ t̂; Â is the middle
         {
             (, MLDSA.Params memory p) = MLDSA.params(set);
@@ -453,7 +535,7 @@ contract MLDSAVerifierTest is Test {
         g = gasleft();
         WalletStandIn wallet = WalletStandIn(bundler.setup(set, pk));
         uint256 gSetup = g - gasleft() + 21000 + _calldataGas(setupData);
-        assertLt(gSetup, 16_777_216, "setup fits one transaction (EIP-7825 cap)");
+        assertLt(gSetup, CAP, "setup fits one transaction (EIP-7825 cap)");
         assertEq(uint8(f.aStatus(set, pkHash)), uint8(MLDSAKeyFactory.AStatus.Committed));
 
         // First transfer: Â in calldata, stored, then the fast path.
@@ -462,6 +544,7 @@ contract MLDSAVerifierTest is Test {
         g = gasleft();
         wallet.transfer(bytes32(m[1]), sig[1], aHat);
         uint256 gFirst = g - gasleft() + 21000 + _calldataGas(firstData);
+        assertLt(gFirst, CAP, "first transfer fits one transaction");
         assertEq(uint8(f.aStatus(set, pkHash)), uint8(MLDSAKeyFactory.AStatus.Stored));
         assertTrue(f.isRegistered(set, pkHash), "fast path now available");
 
@@ -472,6 +555,7 @@ contract MLDSAVerifierTest is Test {
         g = gasleft();
         wallet.transfer(bytes32(m[1]), sig[1], "");
         uint256 gLater = g - gasleft() + 21000 + _calldataGas(laterData);
+        assertLt(gLater, CAP);
         assertEq(wallet.nonce(), 2);
 
         // For comparison: a transfer on a wallet whose Â was never stored (fallback).
@@ -481,6 +565,7 @@ contract MLDSAVerifierTest is Test {
         g = gasleft();
         w2.transfer(bytes32(m[2]), sig[2], "");
         uint256 gFallback = g - gasleft() + 21000 + _calldataGas(fbData);
+        assertLt(gFallback, CAP);
 
         console.log(name, "wallet lifecycle (tx totals incl. 21000 + calldata at 16/4 per byte where noted):");
         console.log("  commitA (call only)", gCommit);
@@ -491,10 +576,69 @@ contract MLDSAVerifierTest is Test {
         console.log("  LATER transfer: fast verify (tx)", gLater);
         console.log("  transfer before A_hat is stored: fallback verify (tx)", gFallback);
         console.log("  calldata gas of A_hat alone", _calldataGas(aHat));
+        console.log("  headroom under the 2^24 cap: setup / first / later / fallback");
+        console.log("   ", CAP - gSetup, CAP - gFirst, CAP - gLater);
+        console.log("   ", CAP - gFallback);
+    }
+
+    /// ML-DSA-87 only: the per-part API, each step in its own fresh factory and
+    /// measured as a transaction (21000 + calldata), all against the cap. (Â as a
+    /// whole — registerA — is over the cap; that is what the parts are for.)
+    function _lifecycleParts87(bytes memory pk, bytes32 pkHash) internal {
+        bytes memory blob = h.precompute(ML_DSA_87, pk);
+        bytes[2] memory part = [_slice(blob, 64, 21504), _slice(blob, 64 + 21504, 21504)];
+        console.log("ML-DSA-87 per-part steps (tx totals):");
+        MLDSAKeyFactory f1 = new MLDSAKeyFactory();
+        for (uint256 i; i < 2; ++i) {
+            vm.cool(address(f1));
+            bytes memory data = abi.encodeCall(MLDSAKeyFactory.registerAPart, (ML_DSA_87, pk, i));
+            uint256 g = gasleft();
+            f1.registerAPart(ML_DSA_87, pk, i);
+            g = g - gasleft() + 21000 + _calldataGas(data);
+            assertLt(g, CAP, "registerAPart fits");
+            console.log("  registerAPart (tx), part", i, g);
+        }
+        MLDSAKeyFactory f2 = new MLDSAKeyFactory();
+        {
+            bytes memory data = abi.encodeCall(MLDSAKeyFactory.commitA, (ML_DSA_87, pk));
+            uint256 g = gasleft();
+            f2.commitA(ML_DSA_87, pk);
+            g = g - gasleft() + 21000 + _calldataGas(data);
+            assertLt(g, CAP, "commitA fits");
+            console.log("  commitA, both parts (tx)", g);
+        }
+        for (uint256 i; i < 2; ++i) {
+            vm.cool(address(f2));
+            bytes memory data = abi.encodeCall(MLDSAKeyFactory.storeAPart, (ML_DSA_87, pkHash, i, part[i]));
+            uint256 g = gasleft();
+            f2.storeAPart(ML_DSA_87, pkHash, i, part[i]);
+            g = g - gasleft() + 21000 + _calldataGas(data);
+            assertLt(g, CAP, "storeAPart fits");
+            console.log("  storeAPart (tx), part", i, g);
+        }
+        {
+            vm.cool(address(f2));
+            bytes memory data = abi.encodeCall(MLDSAKeyFactory.registerT, (ML_DSA_87, pk));
+            uint256 g = gasleft();
+            f2.registerT(ML_DSA_87, pk);
+            g = g - gasleft() + 21000 + _calldataGas(data);
+            assertLt(g, CAP, "registerT fits");
+            console.log("  registerT (tx)", g);
+        }
+        // Both ways end in the same bytes at the same kind of address.
+        assertEq(f1.aPartAddress(ML_DSA_87, pkHash, 1).code, f2.aPartAddress(ML_DSA_87, pkHash, 1).code);
+        assertTrue(f2.isRegistered(ML_DSA_87, pkHash));
+    }
+
+    uint256 internal constant CAP = 16_777_216; // EIP-7825: 2^24 gas per transaction
+
+    function _name(ParamSet set) internal pure returns (string memory) {
+        return set == ML_DSA_44 ? "ML-DSA-44" : set == ML_DSA_65 ? "ML-DSA-65" : "ML-DSA-87";
     }
 
     function _coolAll(MLDSAKeyFactory f, ParamSet set, bytes32 pkHash, address w, address v, address impl) internal {
         (address a, address t) = f.addressesOf(set, pkHash);
+        if (set == ML_DSA_87) vm.cool(f.aPartAddress(set, pkHash, 1));
         vm.cool(a);
         vm.cool(t);
         vm.cool(address(f));
@@ -521,6 +665,10 @@ contract MLDSAVerifierTest is Test {
         _commitStore(ML_DSA_65);
     }
 
+    function test_commitStore_87() public {
+        _commitStore(ML_DSA_87);
+    }
+
     function _commitStore(ParamSet set) internal {
         bytes[] memory pks = _vec(set, "pk");
         bytes[] memory m = _vec(set, "msg");
@@ -543,7 +691,15 @@ contract MLDSAVerifierTest is Test {
         vm.expectRevert(MLDSAKeyFactory.NotCommitted.selector);
         factory.storeA(set, pkHash, aHat);
         bytes32 aHash = factory.commitA(set, pk);
-        assertEq(aHash, keccak256(aHat), "commitment = keccak256(precomputeA(pk))");
+        if (p.aParts == 1) {
+            assertEq(aHash, keccak256(aHat), "commitment = keccak256(precomputeA(pk))");
+        } else {
+            // 87: one commitment per part; commitA returns keccak256(h0 ‖ h1).
+            uint256 half = p.aHatBytes / 2;
+            bytes32 h0 = keccak256(_slice(aHat, 0, half));
+            bytes32 h1 = keccak256(_slice(aHat, half, half));
+            assertEq(aHash, keccak256(abi.encodePacked(h0, h1)), "commitment covers both parts");
+        }
         assertEq(factory.commitA(set, pk), aHash, "idempotent");
         assertEq(uint8(factory.aStatus(set, pkHash)), uint8(MLDSAKeyFactory.AStatus.Committed));
         assertFalse(factory.isRegistered(set, pkHash));
@@ -561,10 +717,14 @@ contract MLDSAVerifierTest is Test {
         bytes memory foreign = _slice(h.precompute(set, pks[2]), 64, p.aHatBytes);
         vm.expectRevert(MLDSAKeyFactory.CommitmentMismatch.selector);
         factory.storeA(set, pkHash, foreign);
-        // Committed under the other set: nothing to store against.
+        // Committed under another set: nothing to store against.
         ParamSet other = set == ML_DSA_44 ? ML_DSA_65 : ML_DSA_44;
         vm.expectRevert(MLDSAKeyFactory.NotCommitted.selector);
         factory.storeA(other, pkHash, aHat);
+        if (!(set == ML_DSA_87)) {
+            vm.expectRevert(MLDSAKeyFactory.NotCommitted.selector);
+            factory.storeA(ML_DSA_87, pkHash, aHat);
+        }
         vm.expectRevert(MLDSAKeyFactory.UnsupportedParamSet.selector);
         factory.storeA(ParamSet.wrap(9), pkHash, aHat);
         assertEq(a.code.length, 0, "nothing at the address");
@@ -573,7 +733,15 @@ contract MLDSAVerifierTest is Test {
         vm.prank(address(0xBEEF));
         assertEq(factory.storeA(set, pkHash, aHat), a);
         assertEq(a.code, viaRegister, "byte-identical to registerA");
-        assertEq(a.code, abi.encodePacked(bytes1(0), aHat), "0x00 || precomputeA(pk)");
+        // 0x00 ‖ precomputeA(pk) — for 87, part 0's half of it (part 1 alongside).
+        uint256 pb = p.aHatBytes / p.aParts;
+        for (uint256 part; part < p.aParts; ++part) {
+            assertEq(
+                factory.aPartAddress(set, pkHash, part).code,
+                abi.encodePacked(bytes1(0), _slice(aHat, part * pb, pb)),
+                "0x00 || precomputeA(pk) part"
+            );
+        }
         assertEq(uint8(factory.aStatus(set, pkHash)), uint8(MLDSAKeyFactory.AStatus.Stored));
         assertEq(factory.storeA(set, pkHash, wrong), a, "idempotent once stored");
         assertEq(a.code, viaRegister);
@@ -586,6 +754,124 @@ contract MLDSAVerifierTest is Test {
         assertTrue(t.code.length != 0);
         assertTrue(factory.verify(set, pkHash, m[1], sig[1]));
         assertEq(fast.verify(set, pk, m[1], sig[1]), slow.verify(set, pk, m[1], sig[1]));
+    }
+
+    // ── ML-DSA-87: Â in two parts ────────────────────────────────────────────
+
+    /// Per-part commitments and stores: wrong bytes for a part (including the
+    /// OTHER part's bytes, and a different key's part) revert and deploy nothing;
+    /// one part stored leaves the fast path off and every path still agrees; the
+    /// second part switches it on; storeA with all of Â fills in what is missing.
+    function test_twoPart_storage_87() public {
+        bytes[] memory pks = _vec(ML_DSA_87, "pk");
+        bytes[] memory m = _vec(ML_DSA_87, "msg");
+        bytes[] memory sig = _vec(ML_DSA_87, "sig");
+        bytes memory pk = pks[1];
+        bytes32 pkHash = keccak256(pk);
+        bytes memory blob = h.precompute(ML_DSA_87, pk);
+        bytes memory aHat = _slice(blob, 64, 43008);
+        bytes[2] memory part = [_slice(aHat, 0, 21504), _slice(aHat, 21504, 21504)];
+        bytes memory foreign1 = _slice(h.precompute(ML_DSA_87, pks[2]), 64 + 21504, 21504);
+        address[2] memory addr = [factory.aPartAddress(ML_DSA_87, pkHash, 0), factory.aPartAddress(ML_DSA_87, pkHash, 1)];
+
+        vm.expectRevert(MLDSAKeyFactory.NotCommitted.selector);
+        factory.storeAPart(ML_DSA_87, pkHash, 0, part[0]);
+        vm.expectRevert(MLDSAKeyFactory.InvalidPart.selector);
+        factory.storeAPart(ML_DSA_87, pkHash, 2, part[0]);
+        vm.expectRevert(MLDSAKeyFactory.InvalidPart.selector);
+        factory.storeAPart(ML_DSA_65, pkHash, 1, part[0]);
+
+        bytes32 aHash = factory.commitA(ML_DSA_87, pk);
+        assertEq(factory.aPartCommitment(ML_DSA_87, pkHash, 0), keccak256(part[0]));
+        assertEq(factory.aPartCommitment(ML_DSA_87, pkHash, 1), keccak256(part[1]));
+        assertEq(aHash, keccak256(abi.encodePacked(keccak256(part[0]), keccak256(part[1]))), "commitment covers both");
+        assertEq(factory.aPartCommitment(ML_DSA_87, pkHash, 2), bytes32(0));
+        assertEq(uint8(factory.aStatus(ML_DSA_87, pkHash)), uint8(MLDSAKeyFactory.AStatus.Committed));
+
+        // Wrong bytes per part: revert, nothing deployed.
+        vm.expectRevert(MLDSAKeyFactory.CommitmentMismatch.selector);
+        factory.storeAPart(ML_DSA_87, pkHash, 1, part[0]); //   part 0's bytes as part 1
+        vm.expectRevert(MLDSAKeyFactory.CommitmentMismatch.selector);
+        factory.storeAPart(ML_DSA_87, pkHash, 0, part[1]); //   and vice versa
+        vm.expectRevert(MLDSAKeyFactory.CommitmentMismatch.selector);
+        factory.storeAPart(ML_DSA_87, pkHash, 1, foreign1); //  another key's part 1
+        vm.expectRevert(MLDSAKeyFactory.CommitmentMismatch.selector);
+        factory.storeAPart(ML_DSA_87, pkHash, 0, aHat); //      all of Â as one part
+        bytes memory flipped = abi.encodePacked(part[1]);
+        flipped[21503] = bytes1(uint8(flipped[21503]) ^ 1);
+        vm.expectRevert(MLDSAKeyFactory.CommitmentMismatch.selector);
+        factory.storeAPart(ML_DSA_87, pkHash, 1, flipped);
+        // storeA (all of Â): parts swapped, truncated, or one part only.
+        vm.expectRevert(MLDSAKeyFactory.CommitmentMismatch.selector);
+        factory.storeA(ML_DSA_87, pkHash, abi.encodePacked(part[1], part[0]));
+        vm.expectRevert(MLDSAKeyFactory.CommitmentMismatch.selector);
+        factory.storeA(ML_DSA_87, pkHash, part[0]);
+        vm.expectRevert(MLDSAKeyFactory.CommitmentMismatch.selector);
+        factory.storeA(ML_DSA_87, pkHash, _slice(aHat, 0, 43007));
+        assertEq(addr[0].code.length + addr[1].code.length, 0, "nothing deployed");
+
+        // T plus part 1 only: no fast path; fast == slow == library on good and bad input.
+        factory.registerT(ML_DSA_87, pk);
+        vm.prank(address(0xBEEF));
+        assertEq(factory.storeAPart(ML_DSA_87, pkHash, 1, part[1]), addr[1]);
+        assertEq(addr[1].code, abi.encodePacked(bytes1(0), part[1]));
+        assertEq(uint8(factory.aPartStatus(ML_DSA_87, pkHash, 0)), uint8(MLDSAKeyFactory.AStatus.Committed));
+        assertEq(uint8(factory.aPartStatus(ML_DSA_87, pkHash, 1)), uint8(MLDSAKeyFactory.AStatus.Stored));
+        assertEq(uint8(factory.aStatus(ML_DSA_87, pkHash)), uint8(MLDSAKeyFactory.AStatus.Committed), "weakest part");
+        assertFalse(factory.isRegistered(ML_DSA_87, pkHash));
+        assertEq(factory.load(ML_DSA_87, pkHash).length, 0);
+        assertFalse(factory.verify(ML_DSA_87, pkHash, m[1], sig[1]), "factory path needs both parts");
+        _agreePartial(pk, m[1], sig[1], true);
+        _agreePartial(pk, m[2], sig[1], false);
+        _agreePartial(pk, m[1], sig[2], false);
+        // Idempotent once stored: wrong bytes for a stored part are ignored.
+        assertEq(factory.storeAPart(ML_DSA_87, pkHash, 1, part[0]), addr[1]);
+        assertEq(addr[1].code, abi.encodePacked(bytes1(0), part[1]));
+
+        // storeA with all of Â stores just the missing part 0; now the fast path.
+        assertEq(factory.storeA(ML_DSA_87, pkHash, aHat), addr[0]);
+        assertEq(addr[0].code, abi.encodePacked(bytes1(0), part[0]));
+        assertTrue(factory.isRegistered(ML_DSA_87, pkHash));
+        assertEq(uint8(factory.aStatus(ML_DSA_87, pkHash)), uint8(MLDSAKeyFactory.AStatus.Stored));
+        assertEq(factory.load(ML_DSA_87, pkHash), blob, "load = precompute");
+        assertEq(factory.load(ML_DSA_87, pkHash), vm.parseJsonBytes(_diff(), ".mldsa87.blob1"), "vs dilithium-py");
+        _agree(ML_DSA_87, pk, m[1], sig[1], true);
+        _agree(ML_DSA_87, pk, m[2], sig[1], false);
+        // Byte-identical to registerA / registerAPart in another factory.
+        MLDSAKeyFactory g = new MLDSAKeyFactory();
+        g.registerAPart(ML_DSA_87, pk, 1);
+        g.registerAPart(ML_DSA_87, pk, 0);
+        assertEq(g.aPartAddress(ML_DSA_87, pkHash, 0).code, addr[0].code);
+        assertEq(g.aPartAddress(ML_DSA_87, pkHash, 1).code, addr[1].code);
+        assertEq(g.aPartCommitment(ML_DSA_87, pkHash, 0), keccak256(part[0]));
+        assertEq(g.commitA(ML_DSA_87, pk), aHash, "registerAPart recorded the same commitments");
+    }
+
+    /// Part-wise registration first, then commitA: commitA only fills the missing
+    /// part's commitment and the result is the same as committing from scratch.
+    function test_twoPart_registerPartThenCommit_87() public {
+        bytes memory pk = _vec(ML_DSA_87, "pk")[2];
+        bytes32 pkHash = keccak256(pk);
+        factory.registerAPart(ML_DSA_87, pk, 0);
+        assertEq(uint8(factory.aStatus(ML_DSA_87, pkHash)), uint8(MLDSAKeyFactory.AStatus.None), "part 1 untouched");
+        assertEq(factory.aPartCommitment(ML_DSA_87, pkHash, 1), bytes32(0));
+        bytes32 aHash = factory.commitA(ML_DSA_87, pk);
+        MLDSAKeyFactory g = new MLDSAKeyFactory();
+        assertEq(g.commitA(ML_DSA_87, pk), aHash);
+        assertEq(uint8(factory.aStatus(ML_DSA_87, pkHash)), uint8(MLDSAKeyFactory.AStatus.Committed));
+        assertEq(uint8(factory.aPartStatus(ML_DSA_87, pkHash, 0)), uint8(MLDSAKeyFactory.AStatus.Stored));
+        // registerA finishes it (part 0 is a no-op, part 1 is computed and stored).
+        assertEq(factory.registerA(ML_DSA_87, pk), factory.aPartAddress(ML_DSA_87, pkHash, 0));
+        assertEq(uint8(factory.aStatus(ML_DSA_87, pkHash)), uint8(MLDSAKeyFactory.AStatus.Stored));
+    }
+
+    /// The fast verifier on a partially stored key: takes the fallback and agrees
+    /// with the empty-factory verifier and the library.
+    function _agreePartial(bytes memory pk, bytes memory m, bytes memory sig, bool want) internal view {
+        assertFalse(factory.isRegistered(ML_DSA_87, keccak256(pk)), "partial: no fast path");
+        assertEq(fast.verify(ML_DSA_87, pk, m, sig), want, "fast (falls back)");
+        assertEq(slow.verify(ML_DSA_87, pk, m, sig), want, "fallback");
+        assertEq(h.verify(ML_DSA_87, pk, m, sig), want, "library");
     }
 
     function test_ensureStored() public {
@@ -601,6 +887,22 @@ contract MLDSAVerifierTest is Test {
         assertTrue(this.ensureStoredExt(ML_DSA_44, pkHash, ""), "already stored");
         assertTrue(this.ensureStoredExt(ML_DSA_44, pkHash, hex"00"), "already stored: bytes ignored");
         assertFalse(this.ensureStoredExt(ParamSet.wrap(3), pkHash, aHat), "unknown set");
+
+        // ML-DSA-87: all of Â (both parts) in one go; or part 0 already stored.
+        bytes[] memory p87 = _vec(ML_DSA_87, "pk");
+        bytes32 h87 = keccak256(p87[1]);
+        bytes memory a87 = _slice(h.precompute(ML_DSA_87, p87[1]), 64, 43008);
+        assertFalse(this.ensureStoredExt(ML_DSA_87, h87, ""), "87 empty: no-op");
+        vm.expectRevert(MLDSAKeyFactory.NotCommitted.selector);
+        this.ensureStoredExt(ML_DSA_87, h87, a87);
+        factory.registerAPart(ML_DSA_87, p87[1], 0); // commits and stores part 0 only
+        vm.expectRevert(MLDSAKeyFactory.NotCommitted.selector);
+        this.ensureStoredExt(ML_DSA_87, h87, a87); //    part 1 not committed yet
+        factory.commitA(ML_DSA_87, p87[1]);
+        assertFalse(this.ensureStoredExt(ML_DSA_87, h87, ""), "half stored is not stored");
+        assertTrue(this.ensureStoredExt(ML_DSA_87, h87, a87));
+        assertEq(factory.aPartAddress(ML_DSA_87, h87, 1).code.length, 21505);
+        assertTrue(this.ensureStoredExt(ML_DSA_87, h87, ""), "87 stored");
     }
 
     function ensureStoredExt(ParamSet set, bytes32 pkHash, bytes calldata aHat) external returns (bool) {
@@ -617,8 +919,12 @@ contract MLDSAVerifierTest is Test {
         _gasInterface(ML_DSA_65);
     }
 
+    function test_gas_interface_87() public {
+        _gasInterface(ML_DSA_87);
+    }
+
     function _gasInterface(ParamSet set) internal {
-        string memory name = set == ML_DSA_44 ? "ML-DSA-44" : "ML-DSA-65";
+        string memory name = _name(set);
         bytes[] memory pk = _vec(set, "pk");
         bytes[] memory m = _vec(set, "msg");
         bytes[] memory sig = _vec(set, "sig");
@@ -647,6 +953,11 @@ contract MLDSAVerifierTest is Test {
             console.log("    library MLDSAKeys.verify by pkHash, in-frame (reference)", gLib);
             console.log("    library, in-frame, hashing the pk first", gLibH);
             console.log("    interface overhead over the in-frame library path", gFast - gLib);
+            // As transactions (21000 + calldata of verify(set, pk, m, sig)) under the cap.
+            uint256 cd = 21000 + _calldataGas(abi.encodeCall(IMLDSAVerifier.verify, (set, pk[v], m[v], sig[v])));
+            console.log("    as a tx: fast / fallback", gFast + cd, gSlow + cd);
+            assertLt(gFast + cd, CAP, "fast path fits a transaction");
+            assertLt(gSlow + cd, CAP, "fallback fits a transaction");
         }
         PkStoreHarness ps = new PkStoreHarness();
         address p = ps.store(pk[1]);
@@ -658,6 +969,7 @@ contract MLDSAVerifierTest is Test {
 
     function _cool(ParamSet set, bytes32 pkHash) internal {
         (address a, address t) = factory.addressesOf(set, pkHash);
+        if (set == ML_DSA_87) vm.cool(factory.aPartAddress(set, pkHash, 1));
         vm.cool(a);
         vm.cool(t);
         vm.cool(address(factory));

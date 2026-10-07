@@ -2,7 +2,8 @@
 """Fixture generator for test/MLDSA.t.sol and MLDSAVerifier.t.sol.
 
 Writes three JSON files next to this script. differential.json and acvp.json
-hold one object per parameter set, under the keys "mldsa44" and "mldsa65":
+hold one object per parameter set, under the keys "mldsa44", "mldsa65" and
+"mldsa87":
 
   differential.json  ML-DSA key/message/context/signature tuples produced by
                      dilithium-py 1.4.0 (the version these fixtures were made with;
@@ -16,15 +17,16 @@ hold one object per parameter set, under the keys "mldsa44" and "mldsa65":
   acvp.json          The sigVer cases from NIST's ACVP-Server, trimmed to the
                      groups the library exposes:
                        external interface, pure (no pre-hash)  -> verifyWithContext
-                         ML-DSA-44: tgId 1   ML-DSA-65: tgId 3
+                         ML-DSA-44: tgId 1   ML-DSA-65: tgId 3    ML-DSA-87: tgId 5
                        internal interface, externalMu = false  -> verifyInternal
-                         ML-DSA-44: tgId 8   ML-DSA-65: tgId 10
+                         ML-DSA-44: tgId 8   ML-DSA-65: tgId 10   ML-DSA-87: tgId 12
                      Each case keeps tcId, expected result and NIST's reason text.
   shake.json         SHAKE128 / SHAKE256 outputs from hashlib, for testing the
                      Keccak sponge independently of ML-DSA.
 
 The "mldsa65" objects are exactly the contents of the single-set ML-DSA-65
-fixtures these files replaced (same seeds, same cases).
+fixtures these files replaced (same seeds, same cases); "mldsa87" was added
+later with the same seeds and cases, leaving the other two byte-identical.
 
 ACVP source (pinned; the three files are fetched at this commit):
   https://github.com/usnistgov/ACVP-Server/tree/a7f283cdc87d2d6dd93c1bac59e5622c5f9f8324/gen-val/json-files/ML-DSA-sigVer-FIPS204
@@ -42,7 +44,7 @@ import os
 import sys
 import urllib.request
 
-from dilithium_py.ml_dsa import ML_DSA_44, ML_DSA_65
+from dilithium_py.ml_dsa import ML_DSA_44, ML_DSA_65, ML_DSA_87
 
 ACVP_COMMIT = "a7f283cdc87d2d6dd93c1bac59e5622c5f9f8324"
 ACVP_URL = (
@@ -59,6 +61,7 @@ Q = 8380417
 SETS = {
     "mldsa44": dict(d=ML_DSA_44, name="ML-DSA-44", pk=1312, sig=2420, blob=15424, tg=(1, 8)),
     "mldsa65": dict(d=ML_DSA_65, name="ML-DSA-65", pk=1952, sig=3309, blob=27712, tg=(3, 10)),
+    "mldsa87": dict(d=ML_DSA_87, name="ML-DSA-87", pk=2592, sig=4627, blob=49216, tg=(5, 12)),
 }
 
 
