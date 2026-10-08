@@ -4,17 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>mldsa-solidity — NIST's post-quantum signatures, verified on-chain</title>
-<meta name="description" content="FIPS 204 ML-DSA-44 and ML-DSA-65 signature verification in pure Solidity. Tested against NIST's ACVP vectors. 2.68M gas per verification. One swappable interface. MIT.">
+<meta name="description" content="FIPS 204 ML-DSA-44, ML-DSA-65 and ML-DSA-87 signature verification in pure Solidity. Tested against NIST's ACVP vectors. 2.69M gas per verification. IMLDSAVerifier and IPQVerifier, plus a key registry with self-authorised rotation. MIT.">
 <link rel="canonical" href="https://skalenetwork.github.io/mldsa-solidity/">
 <meta name="theme-color" content="#0b0f14">
 <meta property="og:type" content="website">
 <meta property="og:title" content="mldsa-solidity — NIST's post-quantum signatures, verified on-chain">
-<meta property="og:description" content="FIPS 204 ML-DSA verification in pure Solidity, tested against NIST's ACVP vectors. 2.68M gas. MIT.">
+<meta property="og:description" content="FIPS 204 ML-DSA-44/65/87 verification in pure Solidity, tested against NIST's ACVP vectors. 2.69M gas. MIT.">
 <meta property="og:url" content="https://skalenetwork.github.io/mldsa-solidity/">
 <meta property="og:image" content="https://skalenetwork.github.io/mldsa-solidity/og-image.png">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="mldsa-solidity — NIST's post-quantum signatures, verified on-chain">
-<meta name="twitter:description" content="FIPS 204 ML-DSA verification in pure Solidity, tested against NIST's ACVP vectors. 2.68M gas. MIT.">
+<meta name="twitter:description" content="FIPS 204 ML-DSA-44/65/87 verification in pure Solidity, tested against NIST's ACVP vectors. 2.69M gas. MIT.">
 <meta name="twitter:image" content="https://skalenetwork.github.io/mldsa-solidity/og-image.png">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <style>
@@ -94,7 +94,7 @@
   td:first-child { white-space:nowrap; }
   td.num { font-family:var(--mono); color:var(--ink); }
   .scroll-x { overflow-x:auto; }
-  @media (max-width:640px){ td:first-child { white-space:normal; } }
+  @media (max-width:640px){ td:first-child { white-space:normal; } th, td { padding:8px 6px; } td.num { font-size:12px; } }
   ol.steps { counter-reset:s; list-style:none; padding:0; margin:0; }
   ol.steps li { position:relative; padding-left:44px; margin-bottom:18px; color:var(--dim); }
   ol.steps li::before { counter-increment:s; content:counter(s); position:absolute; left:0; top:-1px;
@@ -134,6 +134,7 @@
     <nav class="nav-links">
       <a class="hide-sm" href="#why">Why</a>
       <a href="#how">How</a>
+      <a class="hide-sm" href="#registry">Registry</a>
       <a class="hide-sm" href="#gas">Gas</a>
       <a href="#trust">Testing</a>
       <a class="hide-sm" href="#start">Quickstart</a>
@@ -147,7 +148,8 @@
     <div class="badges">
       <span class="badge pq">NIST FIPS 204</span>
       <span class="badge ok">Tested against NIST ACVP vectors</span>
-      <span class="badge">ML-DSA-44 · ML-DSA-65</span>
+      <span class="badge">ML-DSA-44 · 65 · 87</span>
+      <span class="badge">IPQVerifier</span>
       <span class="badge">MIT</span>
       <span class="badge warn">Unaudited</span>
     </div>
@@ -161,16 +163,18 @@
     </p>
 <pre><code><span class="k">import</span> {IMLDSAVerifier, ML_DSA_44} <span class="k">from</span> <span class="s">"mldsa-solidity/IMLDSAVerifier.sol"</span>;
 <span class="c">// true iff sig is a valid ML-DSA-44 signature on message under publicKey</span>
-<span class="k">bool</span> ok = verifier.verify(ML_DSA_44, publicKey, message, sig);</code></pre>
+<span class="k">bool</span> ok = verifier.verify(ML_DSA_44, publicKey, message, sig);
+<span class="c">// the same verifier, through the scheme-neutral IPQVerifier (ML-DSA-44 = 0x0101)</span>
+<span class="k">bool</span> same = IPQVerifier(verifier).verify(PQAlgorithms.ML_DSA_44, publicKey, message, sig);</code></pre>
     <div class="cta">
       <a class="btn primary" href="#start">Get started</a>
       <a class="btn" href="https://github.com/skalenetwork/mldsa-solidity">Source on GitHub</a>
       <a class="btn" href="#trust">How it is tested</a>
     </div>
     <div class="stats">
-      <div class="stat"><div class="v">2.68M</div><div class="l">gas per ML-DSA-44 verification (key registered)</div></div>
-      <div class="stat"><div class="v">3.66M</div><div class="l">gas per ML-DSA-65 verification (key registered)</div></div>
-      <div class="stat"><div class="v">NIST ACVP</div><div class="l">official test vectors, passing and failing cases, both sets</div></div>
+      <div class="stat"><div class="v">2.69M</div><div class="l">gas per ML-DSA-44 verification (key registered)</div></div>
+      <div class="stat"><div class="v">3.68M</div><div class="l">gas per ML-DSA-65 verification (key registered)</div></div>
+      <div class="stat"><div class="v">5.39M</div><div class="l">gas per ML-DSA-87 verification (key registered)</div></div>
       <div class="stat"><div class="v">never reverts</div><div class="l">malformed input of any kind returns <code>false</code></div></div>
     </div>
   </div>
@@ -197,9 +201,11 @@
         <div class="scroll-x">
         <table>
           <tr><td>Standard</td><td>FIPS 204 ML-DSA.Verify (Algorithm 3), the pure variant, with a context string</td></tr>
-          <tr><td>Parameter sets</td><td>ML-DSA-44 (default) and ML-DSA-65, chosen per call</td></tr>
+          <tr><td>Parameter sets</td><td>ML-DSA-44 (default), ML-DSA-65 and ML-DSA-87 (NIST category 5), chosen per call</td></tr>
           <tr><td>Primitives</td><td>SHAKE128 and SHAKE256 on a Keccak-f[1600] permutation in Yul; NTT over Z<sub>q</sub></td></tr>
-          <tr><td>Interface</td><td><code>IMLDSAVerifier</code>, one swappable verifier, ERC-165</td></tr>
+          <tr><td>Interfaces</td><td><code>IMLDSAVerifier</code> and the scheme-neutral <code>IPQVerifier</code>, ERC-165</td></tr>
+          <tr><td>Key ids</td><td><code>MLDSAKeyRegistry</code>: stable ids, rotated by the key itself</td></tr>
+          <tr><td>Tested with</td><td>NIST ACVP vectors and dilithium-py, all three sets, passing and failing cases</td></tr>
           <tr><td>Failure mode</td><td>Returns <code>false</code>, never reverts</td></tr>
           <tr><td>Licence</td><td>MIT</td></tr>
         </table>
@@ -209,13 +215,14 @@
     <div class="cards">
       <div class="card">
         <h3>Swappable by design</h3>
-        <p>Contracts depend on <code>IMLDSAVerifier</code>, never on this implementation. When an ML-DSA precompile or
-        an audited verifier ships, an adapter takes its place behind the same call, with no redesign.</p>
+        <p>Contracts depend on an interface, never on this implementation: <code>IMLDSAVerifier</code>, or
+        <code>IPQVerifier</code>, which SLH-DSA and FN-DSA verifiers answer too. When an ML-DSA precompile or an
+        audited verifier ships, an adapter takes its place behind the same call, with no redesign.</p>
       </div>
       <div class="card">
         <h3>Precomputed keys</h3>
         <p>Everything a verification needs that depends only on the public key is computed once, on-chain, and stored
-        as contract code. That cuts ML-DSA-65 verification from about 9M gas to 3.66M.</p>
+        as contract code. That cuts ML-DSA-65 verification from 9.15M gas to 3.68M, and ML-DSA-87 from 14.09M to 5.39M.</p>
       </div>
       <div class="card">
         <h3>Trust by address</h3>
@@ -240,26 +247,60 @@
     <h3 style="margin-top:40px">Setting up a key</h3>
     <ol class="steps">
       <li><b><code>registerT(set, pk)</code></b>: compute <code>tr</code> and <code>NTT(t₁·2<sup>d</sup>)</code> from the key and store them.</li>
-      <li><b><code>registerA(set, pk)</code></b>: compute the matrix <code>Â</code> and store it. Or split it: <b><code>commitA</code></b> computes it and records only its hash, and <b><code>storeA</code></b> stores the bytes later, accepted only if they match. That keeps a wallet's whole setup inside one transaction.</li>
+      <li><b><code>registerA(set, pk)</code></b>: compute the matrix <code>Â</code> and store it. Or split it: <b><code>commitA</code></b> computes it and records only its hash, and <b><code>storeA</code></b> stores the bytes later, accepted only if they match. That keeps a wallet's whole setup inside one transaction. ML-DSA-87's <code>Â</code> is over the 24,576-byte code limit, so it is kept in two parts, each with its own commitment: <b><code>registerAPart</code></b> and <b><code>storeAPart</code></b> handle one part per transaction.</li>
       <li><b>Verify.</b> <code>MLDSAVerifier</code> takes the fast path when the key's data is registered, and verifies from scratch when it isn't. Both paths give the same answer.</li>
     </ol>
+  </div>
+</section>
+
+<section id="registry">
+  <div class="wrap">
+    <h2>Key ids that outlive keys</h2>
+    <div class="grid2">
+      <div>
+        <p>
+          <code>MLDSAKeyRegistry</code> gives an ML-DSA key a stable id, <code>keccak256(registrant, salt)</code>, that
+          stays the same while the key behind it changes. The registrant picks the first key and keeps no power over the
+          id afterwards. From then on only the current key can hand the id on, by signing an EIP-712
+          <code>RotateKey</code> message over the id, the version it replaces, the new parameter set and the new key's
+          hash. Each rotation signature works exactly once.
+        </p>
+        <p>
+          ML-DSA keeps no per-signature state, so rotation is never forced: it is for suspected compromise, routine
+          renewal, or moving up a parameter set, from ML-DSA-44 to ML-DSA-87 and back.
+        </p>
+      </div>
+      <div class="card">
+        <h3>The calls</h3>
+        <div class="scroll-x">
+        <table>
+          <tr><td><code>register(salt, set, pk)</code></td><td>Create the id with its first key</td></tr>
+          <tr><td><code>rotate(id, set, pk, sig)</code></td><td>Replace the key; <code>sig</code> is by the current key, anyone may submit it</td></tr>
+          <tr><td><code>verify(id, msg, sig)</code></td><td>Check a signature by the key currently behind the id</td></tr>
+          <tr><td><code>getKey(id)</code></td><td>Set, public key and version</td></tr>
+        </table>
+        </div>
+      </div>
+    </div>
   </div>
 </section>
 
 <section id="gas">
   <div class="wrap">
     <h2>Gas</h2>
-    <p>Measured with <code>forge test</code> at 32-byte messages. Everything fits under the EIP-7825 per-transaction cap of 2<sup>24</sup> gas.</p>
+    <p>Measured with <code>forge test</code> at 32-byte messages. Everything fits under the EIP-7825 per-transaction cap of 2<sup>24</sup> (16.78M) gas, except a single-call <code>registerA</code> for ML-DSA-87, which is why it comes in parts.</p>
     <div class="scroll-x">
     <table>
-      <tr><th></th><th>ML-DSA-44</th><th>ML-DSA-65</th></tr>
-      <tr><td>Verify, key registered (through <code>IMLDSAVerifier</code>)</td><td class="num">2.68M</td><td class="num">3.66M</td></tr>
-      <tr><td>Verify, key not registered (full computation)</td><td class="num">5.75M</td><td class="num">9.13M</td></tr>
-      <tr><td><code>registerA</code> / <code>registerT</code></td><td class="num">5.54M / 2.29M</td><td class="num">10.59M / 3.38M</td></tr>
-      <tr><td><code>commitA</code> / <code>storeA</code></td><td class="num">2.88M / 2.88M</td><td class="num">5.63M / 5.34M</td></tr>
+      <tr><th></th><th>ML-DSA-44</th><th>ML-DSA-65</th><th>ML-DSA-87</th></tr>
+      <tr><td>Verify, key registered (through <code>IMLDSAVerifier</code>)</td><td class="num">2.69M</td><td class="num">3.68M</td><td class="num">5.39M</td></tr>
+      <tr><td>Verify, key not registered (full computation)</td><td class="num">5.76M</td><td class="num">9.15M</td><td class="num">14.09M</td></tr>
+      <tr><td><code>registerA</code> / <code>registerT</code></td><td class="num">5.54M / 2.29M</td><td class="num">10.59M / 3.38M</td><td class="num">19.09M* / 4.48M</td></tr>
+      <tr><td><code>commitA</code> / <code>storeA</code></td><td class="num">2.88M / 2.88M</td><td class="num">5.63M / 5.34M</td><td class="num">9.86M / 9.97M*</td></tr>
     </table>
     </div>
-    <p style="margin-top:16px">Sign a 32-byte digest, such as an EIP-712 hash. Each extra 136 bytes of message adds about 89k gas.</p>
+    <p style="margin-top:16px">* ML-DSA-87's <code>Â</code> in two parts: 9.73M per part with <code>registerAPart</code>, 5.36M per part with <code>storeAPart</code>, each its own transaction.</p>
+    <p>Through <code>IPQVerifier</code> the same verification costs 144 to 184 gas more. A key-registry rotation from one ML-DSA-87 key to another, the most expensive kind, is 15.13M gas as a transaction when the current key is not precomputed and 6.42M when it is.</p>
+    <p>Sign a 32-byte digest, such as an EIP-712 hash. Each extra 136 bytes of message adds about 89k gas; for ML-DSA-87 without precomputation, a 3,000-byte message comes within about 0.5M of the cap.</p>
   </div>
 </section>
 
@@ -269,7 +310,7 @@
     <div class="cards">
       <div class="card">
         <h3>NIST's own vectors</h3>
-        <p>The official ACVP <code>ML-DSA-sigVer-FIPS204</code> vectors for both sets, external and internal interfaces,
+        <p>The official ACVP <code>ML-DSA-sigVer-FIPS204</code> vectors for all three sets, external and internal interfaces,
         including every case NIST expects to fail. Pinned at
         <code>usnistgov/ACVP-Server@a7f283c</code>.</p>
       </div>
@@ -285,7 +326,9 @@
       </div>
     </div>
     <p style="margin-top:24px">Plus negative tests for bit flips, wrong lengths, every hint-encoding rule, the exact
-    <code>‖z‖∞</code> boundary and keys used under the wrong parameter set, and fuzzing.</p>
+    <code>‖z‖∞</code> boundary and keys used under the wrong parameter set, and fuzzing. Every vector also runs through
+    <code>IPQVerifier</code>, on the precomputed path and the fallback, and must give the same answer; unknown algorithm
+    ids are <code>false</code>, never a revert.</p>
     <div class="note" style="margin-top:20px">
       <strong>Unaudited.</strong> This is new cryptographic code. It passes NIST's vectors and agrees with an
       independent implementation, but no third party has reviewed it. Weigh that before securing value with it.
@@ -300,6 +343,7 @@
 forge install skalenetwork/mldsa-solidity
 <span class="c"># remappings.txt</span>
 mldsa-solidity/=lib/mldsa-solidity/src/
+pq-verifier-interface/=lib/mldsa-solidity/lib/pq-verifier-interface/src/
 @openzeppelin/contracts/=lib/mldsa-solidity/lib/openzeppelin-contracts/contracts/</code></pre>
 <pre><code><span class="k">import</span> {IMLDSAVerifier, ParamSet, ML_DSA_44} <span class="k">from</span> <span class="s">"mldsa-solidity/IMLDSAVerifier.sol"</span>;
 
