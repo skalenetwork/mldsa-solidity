@@ -5,6 +5,8 @@ import {Test} from "forge-std/Test.sol";
 import {console} from "forge-std/console.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+import {IPQVerifier} from "pq-verifier-interface/IPQVerifier.sol";
+import {PQAlgorithms} from "pq-verifier-interface/PQAlgorithms.sol";
 
 import {IMLDSAVerifier, ParamSet, ML_DSA_44, ML_DSA_65, ML_DSA_87} from "../src/IMLDSAVerifier.sol";
 import {MLDSA} from "../src/MLDSA.sol";
@@ -128,6 +130,16 @@ contract GasProbe {
         g -= gasleft();
     }
 
+    function viaPQ(IPQVerifier v, uint256 alg, bytes calldata pk, bytes calldata m, bytes calldata sig)
+        external
+        view
+        returns (uint256 g, bool ok)
+    {
+        g = gasleft();
+        ok = v.verify(alg, pk, m, sig);
+        g -= gasleft();
+    }
+
     function viaLibrary(address factory, ParamSet set, bytes32 pkHash, bytes calldata m, bytes calldata sig)
         external
         view
@@ -216,28 +228,44 @@ contract MLDSAVerifierTest is Test {
 
     // ── Every vector through the interface: fast path, fallback, library ─────
 
-    function test_interface_differential_44() public {
-        _differential(ML_DSA_44);
+    // (In halves: with IPQVerifier on both paths as well, all eight vectors of a set
+    // in one test pass the per-test gas limit for ML-DSA-87.)
+
+    function test_interface_differential_44_a() public {
+        _differential(ML_DSA_44, 0, 4);
     }
 
-    function test_interface_differential_65() public {
-        _differential(ML_DSA_65);
+    function test_interface_differential_44_b() public {
+        _differential(ML_DSA_44, 4, 99);
     }
 
-    function test_interface_differential_87() public {
-        _differential(ML_DSA_87);
+    function test_interface_differential_65_a() public {
+        _differential(ML_DSA_65, 0, 4);
+    }
+
+    function test_interface_differential_65_b() public {
+        _differential(ML_DSA_65, 4, 99);
+    }
+
+    function test_interface_differential_87_a() public {
+        _differential(ML_DSA_87, 0, 4);
+    }
+
+    function test_interface_differential_87_b() public {
+        _differential(ML_DSA_87, 4, 99);
     }
 
     /// Empty-context vectors must verify; contexted ones (the interface is pure
     /// ML-DSA with ctx = "") must not; and all three paths agree on every input,
     /// including corruptions.
-    function _differential(ParamSet set) internal {
+    function _differential(ParamSet set, uint256 from, uint256 to) internal {
         bytes[] memory pk = _vec(set, "pk");
         bytes[] memory m = _vec(set, "msg");
         bytes[] memory ctx = _vec(set, "ctx");
         bytes[] memory sig = _vec(set, "sig");
         uint256 passed;
-        for (uint256 v; v < pk.length; ++v) {
+        if (to > pk.length) to = pk.length;
+        for (uint256 v = from; v < to; ++v) {
             _register(set, pk[v]);
             bool want = ctx[v].length == 0;
             _agree(set, pk[v], m[v], sig[v], want);
@@ -248,7 +276,7 @@ contract MLDSAVerifierTest is Test {
             _agree(set, pk[v], abi.encodePacked(m[v], bytes1(0)), sig[v], false);
         }
         bytes memory dup = vm.parseJsonBytes(_diff(), string.concat(_key(set), ".malformed.duplicate"));
-        _agree(set, pk[1], m[1], dup, false); // repeated hint index: FIPS 204 rejects
+        if (from <= 1 && 1 < to) _agree(set, pk[1], m[1], dup, false); // repeated hint index: FIPS 204 rejects
         console.log("interface: differential vectors verified on both paths:", passed);
     }
 
@@ -355,12 +383,129 @@ contract MLDSAVerifierTest is Test {
         console.log("interface: of which with empty ctx, checked against NIST:", nistChecked);
     }
 
-    /// fast (registered), slow (fallback) and the library all return `want`.
+    /// fast (registered), slow (fallback) and the library all return `want`, and so do
+    /// fast and slow through IPQVerifier under the set's PQAlgorithms id.
     function _agree(ParamSet set, bytes memory pk, bytes memory m, bytes memory sig, bool want) internal view {
         assertTrue(factory.isRegistered(set, keccak256(pk)), "fast path available");
         assertEq(fast.verify(set, pk, m, sig), want, "fast path");
         assertEq(slow.verify(set, pk, m, sig), want, "fallback");
         assertEq(h.verify(set, pk, m, sig), want, "library");
+        assertEq(IPQVerifier(fast).verify(_alg(set), pk, m, sig), want, "IPQVerifier, fast path");
+        assertEq(IPQVerifier(slow).verify(_alg(set), pk, m, sig), want, "IPQVerifier, fallback");
+    }
+
+    function _alg(ParamSet set) internal pure returns (uint256) {
+        return
+            set == ML_DSA_44
+                ? PQAlgorithms.ML_DSA_44
+                : set == ML_DSA_65 ? PQAlgorithms.ML_DSA_65 : PQAlgorithms.ML_DSA_87;
+    }
+
+    // ── IPQVerifier ──────────────────────────────────────────────────────────
+
+    function test_pq_supportsAndErc165() public view {
+        assertEq(type(IPQVerifier).interfaceId, bytes4(0x97b4ac55));
+        assertEq(
+            type(IPQVerifier).interfaceId,
+            bytes4(keccak256("verify(uint256,bytes,bytes,bytes)")) ^ bytes4(keccak256("supportsAlgorithm(uint256)"))
+        );
+        assertTrue(type(IPQVerifier).interfaceId != type(IMLDSAVerifier).interfaceId);
+        MLDSAVerifier[2] memory vs = [fast, slow];
+        for (uint256 i; i < 2; ++i) {
+            IPQVerifier v = IPQVerifier(vs[i]);
+            assertTrue(v.supportsInterface(0x97b4ac55), "IPQVerifier");
+            assertTrue(v.supportsInterface(type(IMLDSAVerifier).interfaceId), "IMLDSAVerifier");
+            assertTrue(v.supportsInterface(0x01ffc9a7), "ERC-165");
+            assertFalse(v.supportsInterface(0xffffffff));
+            assertFalse(v.supportsInterface(0x00000000));
+            assertTrue(v.supportsAlgorithm(0x0101));
+            assertTrue(v.supportsAlgorithm(0x0102));
+            assertTrue(v.supportsAlgorithm(0x0103));
+            uint256[14] memory no = _unsupportedAlgorithms();
+            for (uint256 k; k < no.length; ++k) {
+                assertFalse(v.supportsAlgorithm(no[k]), vm.toString(no[k]));
+            }
+        }
+    }
+
+    /// Ids that are not ML-DSA-44/65/87: zero, the ParamSet values themselves, ML-DSA's
+    /// neighbours, the other families, and ids that agree with an ML-DSA id in the low bits.
+    function _unsupportedAlgorithms() internal pure returns (uint256[14] memory) {
+        return [
+            uint256(0),
+            1,
+            2,
+            3,
+            0x0100,
+            0x0104,
+            0x01ff,
+            PQAlgorithms.SLH_DSA_SHA2_128S,
+            PQAlgorithms.SLH_DSA_SHAKE_256F,
+            PQAlgorithms.FN_DSA_512,
+            PQAlgorithms.FN_DSA_1024,
+            0x010101,
+            (uint256(1) << 255) | 0x0101,
+            type(uint256).max
+        ];
+    }
+
+    /// A valid signature of each set is false under every id but its own, through both
+    /// paths, and true under its own. The ParamSet value as an algorithm id is not enough.
+    function test_pq_onlyItsOwnIdAccepts() public {
+        ParamSet[3] memory sets = [ML_DSA_44, ML_DSA_65, ML_DSA_87];
+        uint256[14] memory no = _unsupportedAlgorithms();
+        for (uint256 i; i < 3; ++i) {
+            bytes memory pk = _vec(sets[i], "pk")[1];
+            bytes memory m = _vec(sets[i], "msg")[1];
+            bytes memory sg = _vec(sets[i], "sig")[1];
+            _register(sets[i], pk);
+            MLDSAVerifier[2] memory vs = [fast, slow];
+            for (uint256 x; x < 2; ++x) {
+                IPQVerifier v = IPQVerifier(vs[x]);
+                for (uint256 a = 0x0101; a <= 0x0103; ++a) {
+                    assertEq(v.verify(a, pk, m, sg), a == _alg(sets[i]));
+                }
+                for (uint256 k; k < no.length; ++k) {
+                    assertFalse(v.verify(no[k], pk, m, sg), vm.toString(no[k]));
+                }
+            }
+        }
+    }
+
+    /// Never a revert: any id and any bytes, raw in calldata, come back as a decodable bool,
+    /// and an id outside the three is false.
+    function testFuzz_pq_neverReverts(uint256 alg, bytes calldata pk, bytes calldata m, bytes calldata sg) public view {
+        MLDSAVerifier[2] memory vs = [fast, slow];
+        for (uint256 x; x < 2; ++x) {
+            (bool ok, bytes memory ret) =
+                address(vs[x]).staticcall(abi.encodeCall(IPQVerifier.verify, (alg, pk, m, sg)));
+            assertTrue(ok, "no revert");
+            assertEq(ret.length, 32);
+            bool got = abi.decode(ret, (bool));
+            if (alg < 0x0101 || alg > 0x0103) assertFalse(got);
+            assertEq(IPQVerifier(vs[x]).supportsAlgorithm(alg), alg >= 0x0101 && alg <= 0x0103);
+        }
+    }
+
+    /// Valid-length but random key and signature under each ML-DSA id: false, not a revert.
+    function testFuzz_pq_garbageOfTheRightLength(uint8 which, bytes32 seed) public view {
+        ParamSet set = ParamSet.wrap(which % 3);
+        bytes memory pk = _fill(MLDSA.publicKeyBytes(set), seed);
+        bytes memory sg = _fill(MLDSA.signatureBytes(set), keccak256(abi.encode(seed)));
+        (bool ok, bytes memory ret) =
+            address(slow).staticcall(abi.encodeCall(IPQVerifier.verify, (_alg(set), pk, abi.encode(seed), sg)));
+        assertTrue(ok, "no revert");
+        assertFalse(abi.decode(ret, (bool)));
+    }
+
+    function _fill(uint256 n, bytes32 seed) internal pure returns (bytes memory b) {
+        b = new bytes(n);
+        for (uint256 i; i < n; i += 32) {
+            seed = keccak256(abi.encode(seed));
+            for (uint256 j; j < 32 && i + j < n; ++j) {
+                b[i + j] = seed[j];
+            }
+        }
     }
 
     // ── Wrong set, wrong lengths, fallback states ────────────────────────────
@@ -968,6 +1113,13 @@ contract MLDSAVerifierTest is Test {
             console.log("    library MLDSAKeys.verify by pkHash, in-frame (reference)", gLib);
             console.log("    library, in-frame, hashing the pk first", gLibH);
             console.log("    interface overhead over the in-frame library path", gFast - gLib);
+            _cool(set, pkHash);
+            (uint256 gPqFast, bool ok5) = probe.viaPQ(fast, _alg(set), pk[v], m[v], sig[v]);
+            _cool(set, pkHash);
+            (uint256 gPqSlow, bool ok6) = probe.viaPQ(slow, _alg(set), pk[v], m[v], sig[v]);
+            assertTrue(ok5 && ok6);
+            console.log("    IPQVerifier fast path (registered)", gPqFast);
+            console.log("    IPQVerifier fallback (unregistered)", gPqSlow);
             // As transactions (21000 + calldata of verify(set, pk, m, sig)) under the cap.
             uint256 cd = 21000 + _calldataGas(abi.encodeCall(IMLDSAVerifier.verify, (set, pk[v], m[v], sig[v])));
             console.log("    as a tx: fast / fallback", gFast + cd, gSlow + cd);
